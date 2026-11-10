@@ -1,7 +1,11 @@
 // Editor: Quizze mit Spielen, Fragen, Finale und Stechfragen anlegen.
 import { getQuiz, saveQuiz } from './store.js';
-import { newGame, newQuestion, normalizeQuiz, QUESTION_TYPES, WIN_MODES, uid } from './model.js';
+import { newGame, newQuestion, normalizeQuiz, parseYouTube, QUESTION_TYPES, WIN_MODES, uid } from './model.js';
 import { $, $$, esc, toast, readImage, downloadJSON, slug, OPTION_COLORS, OPTION_LETTERS } from './ui.js';
+import { saveMediaFile, bundleQuiz, mediaUrl } from './media.js';
+
+const ALL_TYPES = ['mc', 'tf', 'estimate', 'order', 'buzzer'];
+const MAX_MEDIA_MB = 200;
 
 let quiz = null;
 let root = null;
@@ -99,7 +103,7 @@ function render() {
         </div>
         <p class="muted" style="margin-top:0">${finalHint(f)}</p>
         <div class="field"><label>Beschreibung (wird vor dem Finale gezeigt)</label><textarea data-bind="final.description">${esc(f.description)}</textarea></div>
-        ${questionList('final.questions', ['mc', 'tf', 'estimate'])}
+        ${questionList('final.questions', ALL_TYPES)}
       </div>
     </details>
 
@@ -113,6 +117,7 @@ function render() {
     </details>
   </div>`;
   window.scrollTo(0, scrollY);
+  hydratePreviews();
 }
 
 function finalHint(f) {
@@ -148,7 +153,7 @@ function gameBlock(g, i) {
       </div>
       <div class="field"><label>${g.type === 'manual' ? 'Regeln / Beschreibung' : 'Beschreibung (optional)'}</label><textarea data-bind="${p}.description">${esc(g.description)}</textarea></div>
       ${g.type === 'quiz' ? `
-        ${questionList(`${p}.questions`, ['mc', 'tf', 'estimate'])}
+        ${questionList(`${p}.questions`, ALL_TYPES)}
         <h3 style="margin-top:18px;font-size:1em">Eigene Stechfrage <span class="muted" style="font-weight:400">(optional, sonst aus dem Vorrat)</span></h3>
         ${g.tiebreaker ? questionCard(g.tiebreaker, `${p}.tiebreaker`, 'Stechfrage', null) : `<button class="btn small" data-act="addTie" data-i="${i}">+ Stechfrage hinzufügen</button>`}
       ` : ''}
@@ -177,6 +182,16 @@ function questionCard(q, p, label, pos) {
   } else if (q.type === 'tf') {
     answer = `<div style="width:200px"><label>Richtige Antwort</label><select data-bind="${p}.correct" data-bool>
       <option value="true" ${q.correct ? 'selected' : ''}>Wahr</option><option value="false" ${!q.correct ? 'selected' : ''}>Falsch</option></select></div>`;
+  } else if (q.type === 'order') {
+    answer = `<label>Einträge in der <b>richtigen</b> Reihenfolge (auf den Handys erscheinen sie gemischt)</label>
+      <div class="order-edit">${q.items.map((t, k) => `<div class="opt"><span class="letter" style="background:var(--panel2)">${k + 1}</span>
+        <input type="text" data-bind="${p}.items.${k}" value="${esc(t)}" placeholder="Eintrag ${k + 1}">
+        ${q.items.length > 2 ? `<button class="btn small ghost" data-act="delItem" data-path="${p}" data-i="${k}" title="Entfernen">✕</button>` : ''}</div>`).join('')}</div>
+      ${q.items.length < 6 ? `<button class="btn small" style="margin-top:6px" data-act="addItem" data-path="${p}">+ Eintrag</button>` : ''}
+      <p class="muted" style="margin:.4em 0 0;font-size:.85em">Zählt als richtig, wenn die komplette Reihenfolge stimmt.</p>`;
+  } else if (q.type === 'buzzer') {
+    answer = `<div class="field"><label>Lösung (wird bei der Auflösung gezeigt)</label><input type="text" data-bind="${p}.answer" value="${esc(q.answer || '')}"></div>
+      <p class="muted" style="margin:0;font-size:.85em">Wer zuerst buzzert, antwortet laut. Du wertest mit „Richtig“ oder „Falsch“. Falsch = Minuspunkt, die Frage ist dann vorbei. Die Zeit ist das Buzzer-Fenster.</p>`;
   } else {
     answer = `<div class="row"><div style="width:200px"><label>Lösung (Zahl)</label><input type="number" step="any" data-bind="${p}.correct" data-num value="${q.correct}"></div>
       <div style="width:160px"><label>Einheit (optional)</label><input type="text" data-bind="${p}.unit" value="${esc(q.unit || '')}" placeholder="z. B. km"></div></div>`;
@@ -188,12 +203,40 @@ function questionCard(q, p, label, pos) {
     <div class="field"><textarea data-bind="${p}.text" placeholder="Fragetext">${esc(q.text)}</textarea></div>
     <div class="field">${q.image
       ? `<img class="thumb" src="${q.image}" alt=""><button class="btn small danger" data-act="imgDel" data-path="${p}">Bild entfernen</button>`
-      : `<label class="btn small" style="display:inline-flex;color:var(--text);font-size:.88em">🖼 Bild hinzufügen<input type="file" accept="image/*" data-img="${p}" hidden></label>`}</div>
+      : `<label class="btn small" style="display:inline-flex;color:var(--text);font-size:.88em">🖼 Bild hinzufügen<input type="file" accept="image/*" data-img="${p}" hidden></label>`}
+      ${mediaEditor(q, p)}</div>
     ${answer}
   </div>`;
 }
 
 // ---------------------------------------------------------------- Ereignisse
+
+function mediaEditor(q, p) {
+  const m = q.media;
+  const first = `<label class="check" style="margin-top:6px"><input type="checkbox" data-bind="${p}.mediaFirst" ${q.mediaFirst ? 'checked' : ''}> Erst abspielen, dann Antworten freigeben</label>`;
+  if (!m) {
+    return `<label class="btn small" style="display:inline-flex;color:var(--text);font-size:.88em">🎬 Video/Audio-Datei<input type="file" accept="video/*,audio/*" data-mediafile="${p}" hidden></label>
+      <button class="btn small" data-act="mediaYT" data-path="${p}">▶ YouTube-Link</button>`;
+  }
+  if (m.kind === 'file') {
+    const isAudio = (m.mime || '').startsWith('audio');
+    return `<div class="media-box"><b>${isAudio ? '🔊' : '🎬'} ${esc(m.name || 'Mediendatei')}</b> <span class="muted">(${(m.size / 1048576).toFixed(1)} MB)</span>
+      <button class="btn small danger" data-act="mediaDel" data-path="${p}">Entfernen</button>
+      <div><${isAudio ? 'audio' : 'video'} class="media-preview" data-prev="${m.id}" controls preload="metadata"></${isAudio ? 'audio' : 'video'}></div>${first}</div>`;
+  }
+  return `<div class="media-box"><b>▶ YouTube</b> <button class="btn small danger" data-act="mediaDel" data-path="${p}">Entfernen</button>
+    <div class="row" style="margin-top:6px"><div class="grow"><label>Link</label><input type="text" data-bind="${p}.media.url" value="${esc(m.url || '')}" placeholder="https://www.youtube.com/watch?v=…"></div>
+      <div style="width:110px"><label>Start (Sek.)</label><input type="number" min="0" data-bind="${p}.media.start" data-num value="${m.start || 0}"></div>
+      <div style="width:110px"><label>Ende (Sek., 0 = bis Schluss)</label><input type="number" min="0" data-bind="${p}.media.end" data-num value="${m.end || 0}"></div></div>
+    <div class="muted" style="font-size:.85em">${m.vid ? `Video erkannt ✓ (${esc(m.vid)})` : 'Noch kein gültiger Link.'} Braucht am Abend Internet. Manche Videos erlauben kein Einbetten.</div>${first}</div>`;
+}
+
+async function hydratePreviews() {
+  for (const el of $$('[data-prev]', root)) {
+    const url = await mediaUrl(el.dataset.prev);
+    if (url) el.src = url;
+  }
+}
 
 function valueOf(el) {
   if (el.type === 'checkbox') return el.checked;
@@ -213,6 +256,29 @@ function onInput(e) {
 
 async function onChange(e) {
   const el = e.target;
+  if (el.dataset.mediafile) {
+    const file = el.files && el.files[0];
+    if (!file) return;
+    if (file.size > MAX_MEDIA_MB * 1048576) { toast(`Datei ist zu groß (max. ${MAX_MEDIA_MB} MB). Tipp: Clip kürzen.`, 4000); return; }
+    try {
+      toast('Datei wird gespeichert …');
+      set(el.dataset.mediafile + '.media', await saveMediaFile(file));
+      scheduleSave();
+      render();
+    } catch (err) { toast('Speichern fehlgeschlagen: ' + err.message, 4000); }
+    return;
+  }
+  if (el.dataset.bind && el.dataset.bind.endsWith('.media.url')) {
+    const base = el.dataset.bind.replace(/\.url$/, '');
+    const m = get(base);
+    const parsed = parseYouTube(el.value);
+    m.url = el.value;
+    m.vid = parsed ? parsed.vid : '';
+    if (parsed && parsed.start && !m.start) m.start = parsed.start;
+    scheduleSave();
+    render();
+    return;
+  }
   if (el.dataset.img) {
     const file = el.files && el.files[0];
     if (!file) return;
@@ -248,7 +314,7 @@ function onClick(e) {
   switch (act) {
     case 'export':
       flush();
-      downloadJSON(quiz, `${slug(quiz.title)}.quiz.json`);
+      bundleQuiz(quiz).then(b => downloadJSON(b, `${slug(quiz.title)}.quiz.json`));
       return;
     case 'addGame': {
       const g = newGame(quiz.games.length + 1, type);
@@ -291,6 +357,18 @@ function onClick(e) {
       break;
     case 'imgDel':
       set(path + '.image', null);
+      break;
+    case 'mediaYT':
+      set(path + '.media', { kind: 'youtube', url: '', vid: '', start: 0, end: 0 });
+      break;
+    case 'mediaDel':
+      set(path + '.media', null);
+      break;
+    case 'addItem':
+      get(path).items.push('');
+      break;
+    case 'delItem':
+      get(path).items.splice(i, 1);
       break;
     default:
       return;

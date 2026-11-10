@@ -1,4 +1,4 @@
-// Handy-Ansicht: beitreten und antworten.
+// Handy-Ansicht: beitreten, antworten, buzzern, Joker setzen.
 import { createClient } from './net.js';
 import { $, esc, OPTION_COLORS, OPTION_LETTERS } from './ui.js';
 
@@ -6,15 +6,25 @@ const app = $('#app');
 const params = new URLSearchParams(location.search);
 let code = (params.get('r') || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 const isTest = params.has('test'); // Test-Tabs am Laptop bekommen eine eigene Identität
-const store = isTest ? sessionStorage : localStorage;
+const baseStore = isTest ? sessionStorage : localStorage;
+const ns = isTest ? '-t' + params.get('test') : '';
+const store = {
+  getItem: k => baseStore.getItem(k + ns),
+  setItem: (k, v) => baseStore.setItem(k + ns, v),
+  removeItem: k => baseStore.removeItem(k + ns),
+};
 
 let client = null;
 let view = null;
 let status = 'connecting';
-let sentFor = null; // Frage-ID, für die bereits geantwortet wurde
+let sentFor = null;     // Frage-ID, für die bereits geantwortet wurde
+let buzzedFor = null;   // Frage-ID, für die gebuzzert wurde
 let qDeadline = 0;
 let raf = null;
 let lastQ = null;
+let lastKey = null;
+let order = { qid: null, seq: [] }; // Reihenfolge-Frage: getippte Reihenfolge
+let armedDouble = false;
 
 function pidKey() { return 'qa-pid-' + code; }
 
@@ -100,22 +110,34 @@ function renderStatus() {
 
 // ---------------------------------------------------------------- Spielansicht
 
-let lastKey = null;
+function viewKey(v) {
+  if (v.phase === 'q' && v.q) {
+    const q = v.q;
+    return ['q', q.id, q.answered, q.locked, q.waiting, q.buzz ? q.buzz.name : '', q.usedFifty, q.usedTime,
+      q.jokers ? `${q.jokers.fifty}/${q.jokers.time}` : '-', sentFor, buzzedFor].join('|');
+  }
+  if (v.phase === 'intro') return ['intro', v.title, v.double ? `${v.double.left}/${v.double.used}` : '', armedDouble].join('|');
+  return null;
+}
 
 function onView(v) {
   const newQ = v.q && (!lastQ || lastQ !== v.q.id);
   if (v.q) {
     qDeadline = Date.now() + v.q.remaining;
-    if (newQ && navigator.vibrate) navigator.vibrate(60);
+    if (newQ) {
+      if (navigator.vibrate) navigator.vibrate(60);
+      order = { qid: v.q.id, seq: [] };
+    }
     lastQ = v.q.id;
   } else lastQ = null;
+  if (v.phase !== 'intro') armedDouble = false;
   view = v;
-  // Während einer Frage nicht neu zeichnen, wenn sich für dieses Handy nichts geändert hat
-  // (sonst ginge z. B. eine angefangene Schätzung verloren).
-  const key = v.phase === 'q' && v.q ? ['q', v.q.id, v.q.answered, v.q.locked, sentFor].join('|') : null;
+  // Nicht neu zeichnen, wenn sich für dieses Handy nichts geändert hat (sonst gehen Eingaben verloren).
+  const key = viewKey(v);
   if (key && key === lastKey) {
     const topEl = document.querySelector('.phone-top');
     if (topEl) topEl.innerHTML = topBar(v);
+    if (v.q && !v.q.locked && !v.q.waiting) animateTimer(v.q);
     return;
   }
   lastKey = key;
@@ -126,45 +148,107 @@ function topBar(v) {
   const me = v.me || {};
   let right = `${me.total ?? 0} ${me.total === 1 ? 'Punkt' : 'Punkte'}`;
   if (v.final) right = v.final.lives !== undefined ? `❤ ${v.final.lives}` : `Finale: ${v.final.score}${v.final.target ? ' / ' + v.final.target : ''}`;
-  return `<span class="me"><span class="dot" style="background:${me.color || '#888'}"></span>${esc(me.name || '')}</span><span>${right}${me.rank && !v.final ? ` · Platz ${me.rank}` : ''}</span>`;
+  const j = me.jokers || {};
+  const jk = [['double', '⚡'], ['fifty', '½'], ['time', '⏱']].filter(([k]) => j[k] > 0).map(([k, i]) => `${i}${j[k] > 1 ? j[k] : ''}`).join(' ');
+  return `<span class="me"><span class="dot" style="background:${me.color || '#888'}"></span>${esc(me.name || '')}${jk ? ` <span class="p-jk">${jk}</span>` : ''}</span><span>${right}${me.rank && !v.final ? ` · Platz ${me.rank}` : ''}</span>`;
 }
 
 function render() {
   cancelAnimationFrame(raf);
   const v = view;
   if (!v) return;
+  // angefangene Schätzung retten
+  const est = $('#est');
+  const keep = est ? { qid: est.dataset.qid, val: est.value } : null;
+
   let main;
   if (v.phase === 'q' && v.q) main = renderQuestion(v.q);
   else if (v.phase === 'reveal' && v.r) main = renderReveal(v.r);
-  else main = `<div class="big-icon">${v.icon || '🎲'}</div><h1>${esc(v.title)}</h1>${v.sub ? `<p class="muted" style="font-size:1.1em">${esc(v.sub)}</p>` : ''}`;
+  else if (v.phase === 'intro') main = renderIntro(v);
+  else main = waitScreen(v);
   app.innerHTML = page(topBar(v), main);
   renderStatus();
   bind();
-  if (v.phase === 'q' && v.q && !v.q.locked) animateTimer(v.q);
+  const est2 = $('#est');
+  if (est2 && keep && keep.qid === est2.dataset.qid) est2.value = keep.val;
+  if (v.phase === 'q' && v.q && !v.q.locked && !v.q.waiting) animateTimer(v.q);
+}
+
+function waitScreen(v) {
+  return `<div class="big-icon">${v.icon || '🎲'}</div><h1>${esc(v.title)}</h1>${v.sub ? `<p class="muted" style="font-size:1.1em">${esc(v.sub)}</p>` : ''}`;
+}
+
+function renderIntro(v) {
+  let joker = '';
+  if (v.double) {
+    if (v.double.used) joker = '<div class="p-joker-set">⚡ Verdoppelt! Ein Sieg in diesem Spiel zählt doppelt.</div>';
+    else if (v.double.left > 0) {
+      joker = `<button class="btn big p-joker-btn ${armedDouble ? 'armed' : ''}" id="double">${armedDouble ? 'Wirklich setzen? Nochmal tippen' : `⚡ Verdoppeln-Joker setzen (noch ${v.double.left})`}</button>`;
+    }
+  }
+  return `${waitScreen(v)}${joker}`;
+}
+
+function jokerBar(q) {
+  if (!q.jokers) return '';
+  const b = [];
+  if (q.jokers.fifty > 0) b.push(`<button class="btn small p-jbtn" data-joker="fifty">½ 50:50 (${q.jokers.fifty})</button>`);
+  if (q.jokers.time > 0) b.push(`<button class="btn small p-jbtn" data-joker="time">⏱ +10 s (${q.jokers.time})</button>`);
+  return b.length ? `<div class="p-jokers">${b.join('')}</div>` : '';
 }
 
 function renderQuestion(q) {
+  const head = `<div style="font-weight:700;font-size:1.15em">${esc(q.text)}</div>`;
+  if (q.waiting) return `<div class="big-icon">👀</div><h1>Gut aufpassen!</h1><p class="muted">Schau auf den großen Bildschirm. Gleich geht es los.</p>`;
+
+  if (q.type === 'buzzer') {
+    if (q.buzz) {
+      return q.buzz.me
+        ? '<div class="big-icon">🎤</div><h1>Du bist dran!</h1><p class="muted" style="font-size:1.1em">Sag deine Antwort laut.</p>'
+        : `<div class="big-icon">🔔</div><h1>${esc(q.buzz.name)} hat gebuzzert</h1>`;
+    }
+    if (q.locked) return '<div class="big-icon">⌛</div><h1>Zeit abgelaufen</h1>';
+    if (buzzedFor === q.id) return '<div class="big-icon">🔔</div><h1>Gebuzzert …</h1>';
+    return `<div class="p-timer"><i id="ptimer"></i></div>${head}<button class="p-buzz" id="buzz">BUZZ!</button>`;
+  }
+
   const answered = q.answered || sentFor === q.id;
   if (answered) return `<div class="big-icon">✅</div><h1>Antwort gesendet</h1><p class="muted">Warte auf die Auflösung …</p>`;
   if (q.locked) return `<div class="big-icon">⌛</div><h1>Zeit abgelaufen</h1>`;
+
   let input;
   if (q.type === 'mc') {
     input = `<div class="p-answers">${q.options.map(o => `<button class="p-ans" data-v="${o.i}" style="background:${OPTION_COLORS[o.i]}"><span class="l">${OPTION_LETTERS[o.i]}</span><span class="t">${esc(o.t)}</span></button>`).join('')}</div>`;
   } else if (q.type === 'tf') {
     input = `<div class="p-answers two"><button class="p-ans" data-v="true" style="background:#22a06b"><span class="l">✓</span><span class="t">Wahr</span></button>
       <button class="p-ans" data-v="false" style="background:#e63e5c"><span class="l">✗</span><span class="t">Falsch</span></button></div>`;
+  } else if (q.type === 'order') {
+    const seq = order.qid === q.id ? order.seq : [];
+    input = `<div class="muted" style="font-size:.9em">Tippe die Einträge in der richtigen Reihenfolge an.</div>
+      <div class="p-order">${q.items.map(it => {
+        const pos = seq.indexOf(it.i);
+        return `<button class="p-order-item ${pos >= 0 ? 'set' : ''}" data-oi="${it.i}" ${pos >= 0 ? 'disabled' : ''}>${pos >= 0 ? `<span class="badge">${pos + 1}</span>` : ''}${esc(it.t)}</button>`;
+      }).join('')}</div>
+      <div class="row" style="justify-content:center">
+        <button class="btn" id="oreset" ${seq.length ? '' : 'disabled'}>Zurücksetzen</button>
+        <button class="btn primary" id="osend" ${seq.length === q.items.length ? '' : 'disabled'}>Abschicken</button>
+      </div>`;
   } else {
-    input = `<input type="text" inputmode="decimal" id="est" class="p-input" placeholder="Deine Schätzung" autocomplete="off">
+    input = `<input type="text" inputmode="decimal" id="est" data-qid="${q.id}" class="p-input" placeholder="Deine Schätzung" autocomplete="off">
       ${q.unit ? `<div class="muted">in ${esc(q.unit)}</div>` : ''}
       <button class="btn primary big" id="send">Abschicken</button>`;
   }
-  return `<div class="p-timer"><i id="ptimer"></i></div>
-    <div style="font-weight:700;font-size:1.15em">${esc(q.text)}</div>
-    ${input}`;
+  const used = `${q.usedFifty ? '<span class="p-used">½ 50:50 aktiv</span>' : ''}${q.usedTime ? '<span class="p-used">⏱ +10 s aktiv</span>' : ''}`;
+  return `<div class="p-timer"><i id="ptimer"></i></div>${head}${used ? `<div>${used}</div>` : ''}${input}${jokerBar(q)}`;
 }
 
 function renderReveal(r) {
   if (!r.eligible) return `<div class="big-icon">👀</div><h1>Auflösung</h1><p class="muted">Lösung: ${esc(r.solution)}</p>`;
+  if (r.type === 'buzzer') {
+    if (r.good) return `<div class="big-icon">🎉</div><div class="verdict good">Richtig!</div><p>Lösung: <b>${esc(r.solution)}</b></p>`;
+    if (r.penalty) return `<div class="big-icon">😬</div><div class="verdict bad">Falsch – Minuspunkt</div><p>Lösung: <b>${esc(r.solution)}</b></p>${r.lostLife ? '<p style="color:var(--bad);font-weight:700">−1 Leben</p>' : ''}`;
+    return `<div class="big-icon">💡</div><h1>Lösung: ${esc(r.solution)}</h1>${r.buzzName ? `<p class="muted">${esc(r.buzzName)} hatte gebuzzert.</p>` : '<p class="muted">Niemand hat gebuzzert.</p>'}`;
+  }
   const verdict = r.good ? '<div class="verdict good">Richtig!</div>' : r.answered ? '<div class="verdict bad">Leider falsch</div>' : '<div class="verdict bad">Keine Antwort</div>';
   return `<div class="big-icon">${r.good ? '🎉' : '😬'}</div>${verdict}
     <p style="font-size:1.1em">Lösung: <b>${esc(r.solution)}</b></p>
@@ -204,15 +288,44 @@ function bind() {
     $('#send').onclick = go;
     est.onkeydown = e => { if (e.key === 'Enter') go(); };
   }
+  document.querySelectorAll('[data-oi]').forEach(b => b.onclick = () => {
+    if (order.qid !== view.q.id) order = { qid: view.q.id, seq: [] };
+    order.seq.push(Number(b.dataset.oi));
+    render();
+  });
+  const reset = $('#oreset');
+  if (reset) reset.onclick = () => { order.seq = []; render(); };
+  const osend = $('#osend');
+  if (osend) osend.onclick = () => send(order.seq.slice());
+  const buzz = $('#buzz');
+  if (buzz) buzz.onclick = () => {
+    const q = view.q;
+    if (client && client.send({ t: 'buzz', qid: q.id })) {
+      buzzedFor = q.id;
+      if (navigator.vibrate) navigator.vibrate(150);
+      render();
+    }
+  };
+  document.querySelectorAll('[data-joker]').forEach(b => b.onclick = () => {
+    if (client) client.send({ t: 'joker', kind: b.dataset.joker, qid: view.q && view.q.id });
+    b.disabled = true;
+  });
+  const dbl = $('#double');
+  if (dbl) dbl.onclick = () => {
+    if (!armedDouble) { armedDouble = true; lastKey = null; render(); return; }
+    armedDouble = false;
+    if (client) client.send({ t: 'joker', kind: 'double' });
+    dbl.disabled = true;
+  };
 }
 
 function animateTimer(q) {
+  cancelAnimationFrame(raf);
   const bar = $('#ptimer');
   if (!bar) return;
   (function frame() {
-    const end = qDeadline;
-    const rest = Math.max(0, end - Date.now());
-    bar.style.transform = `scaleX(${q.dur ? rest / q.dur : 0})`;
+    const rest = Math.max(0, qDeadline - Date.now());
+    bar.style.transform = `scaleX(${q.dur ? Math.min(1, rest / q.dur) : 0})`;
     if (rest > 0) raf = requestAnimationFrame(frame);
   })();
 }

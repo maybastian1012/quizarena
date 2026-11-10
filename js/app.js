@@ -1,7 +1,9 @@
 // Laptop-Seite: Übersicht, Abend einrichten, Editor und Spielleiter-Ansicht.
 import { listQuizzes, getQuiz, saveQuiz, deleteQuiz, kvGet, kvSet } from './store.js';
-import { newQuiz, normalizeQuiz, sampleQuiz, validateQuiz, uid } from './model.js';
+import { newQuiz, normalizeQuiz, sampleQuiz, sampleQuiz2, validateQuiz, uid, JOKERS } from './model.js';
 import { $, $$, esc, toast, downloadJSON, slug } from './ui.js';
+import { bundleQuiz, unbundleQuiz, gcMedia } from './media.js';
+import { unlockAudio } from './sfx.js';
 import { startEditor, stopEditor } from './editor.js';
 import { startHost, stopHost, createSession } from './host.js';
 import { makeCode } from './net.js';
@@ -32,6 +34,11 @@ async function renderHome() {
     await saveQuiz(sampleQuiz());
     await kvSet('seeded', true);
   }
+  if (!(await kvGet('seeded2'))) {
+    await saveQuiz(sampleQuiz2());
+    await kvSet('seeded2', true);
+  }
+  gcMedia().catch(() => {});
   const quizzes = await listQuizzes();
   const session = await kvGet('session');
   app.innerHTML = `<div class="home">
@@ -70,7 +77,7 @@ async function renderHome() {
         q.id = uid(); q.title += ' (Kopie)';
         await saveQuiz(q); renderHome(); break;
       }
-      case 'export': { const q = await getQuiz(id); downloadJSON(q, `${slug(q.title)}.quiz.json`); break; }
+      case 'export': { const q = await getQuiz(id); downloadJSON(await bundleQuiz(q), `${slug(q.title)}.quiz.json`); break; }
       case 'del': {
         const q = await getQuiz(id);
         if (confirm(`„${q.title}“ wirklich löschen? Das lässt sich nicht rückgängig machen. Tipp: vorher exportieren.`)) { await deleteQuiz(id); renderHome(); }
@@ -82,7 +89,7 @@ async function renderHome() {
     const file = e.target.files[0];
     if (!file) return;
     try {
-      const q = normalizeQuiz(JSON.parse(await file.text()));
+      const q = normalizeQuiz(await unbundleQuiz(JSON.parse(await file.text())));
       q.id = uid();
       await saveQuiz(q);
       toast(`„${q.title}“ importiert`);
@@ -110,6 +117,13 @@ async function renderSetup(id) {
       <label class="check field"><input type="radio" name="mode" value="single" checked> Einzelspieler – jede Person mit eigenem Handy</label>
       <label class="check field"><input type="radio" name="mode" value="team"> Teams – ein Handy pro Team</label>
     </div>
+    <div class="card" style="margin-top:16px">
+      <h3>Joker pro ${'Spieler/Team'} und Abend</h3>
+      ${Object.entries(JOKERS).map(([k, j]) => `<div class="row field" style="align-items:center">
+        <div style="width:90px"><input type="number" min="0" max="9" value="1" data-joker="${k}"></div>
+        <div class="grow"><b>${j.icon} ${j.label}</b><div class="muted" style="font-size:.85em">${j.hint}</div></div></div>`).join('')}
+      <p class="muted" style="margin:0;font-size:.85em">0 = Joker nicht verwenden. Eingesetzt werden die Joker über die Handys.</p>
+    </div>
     ${session ? `<div class="notice">Es läuft noch ein Abend (${esc(session.quiz.title)}). Wenn du einen neuen startest, wird der alte Spielstand gelöscht.</div>` : ''}
     <div style="margin-top:20px;display:flex;gap:.6em;flex-wrap:wrap">
       <button class="btn primary big" id="go">Lobby öffnen ▶</button>
@@ -118,7 +132,10 @@ async function renderSetup(id) {
   $('#go').onclick = async () => {
     if (session && !confirm('Laufenden Abend verwerfen und neuen starten?')) return;
     const mode = $('input[name=mode]:checked').value;
-    const s = createSession(quiz, mode);
+    const jokers = {};
+    $$('[data-joker]').forEach(i => { jokers[i.dataset.joker] = Math.max(0, Math.min(9, parseInt(i.value, 10) || 0)); });
+    unlockAudio();
+    const s = createSession(quiz, mode, jokers);
     s.code = makeCode();
     await kvSet('session', s);
     location.hash = 'host';

@@ -1,6 +1,6 @@
 // Speicherung im Browser (IndexedDB): Quizze und der laufende Abend.
 const DB_NAME = 'quizarena';
-const VERSION = 1;
+const VERSION = 2;
 let dbPromise = null;
 
 function open() {
@@ -11,6 +11,7 @@ function open() {
         const db = req.result;
         if (!db.objectStoreNames.contains('quizzes')) db.createObjectStore('quizzes', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
+        if (!db.objectStoreNames.contains('media')) db.createObjectStore('media'); // Video-/Audiodateien als Blob
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
@@ -37,3 +38,7 @@ export const deleteQuiz = id => run('quizzes', 'readwrite', s => s.delete(id));
 export const kvGet = key => run('kv', 'readonly', s => s.get(key));
 export const kvSet = (key, value) => run('kv', 'readwrite', s => s.put(value, key));
 export const kvDel = key => run('kv', 'readwrite', s => s.delete(key));
+export const putMedia = (id, blob) => run('media', 'readwrite', s => s.put(blob, id));
+export const getMedia = id => run('media', 'readonly', s => s.get(id));
+export const deleteMedia = id => run('media', 'readwrite', s => s.delete(id));
+export const listMediaKeys = () => run('media', 'readonly', s => s.getAllKeys());

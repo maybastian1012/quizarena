@@ -1,8 +1,10 @@
 // Spielleiter-Ansicht (Laptop/TV): steuert den ganzen Abend.
 import { kvGet, kvSet, kvDel } from './store.js';
 import { createHost } from './net.js';
-import { correctText, formatNumber, uid } from './model.js';
+import { correctText, formatNumber, uid, orderIndices, JOKERS } from './model.js';
 import { $, $$, esc, toast, confetti, PLAYER_COLORS, OPTION_COLORS, OPTION_LETTERS } from './ui.js';
+import { hydrateMedia } from './media.js';
+import { sfx, isMuted, toggleMute, unlockAudio } from './sfx.js';
 
 /* global QRCode */
 
@@ -15,12 +17,17 @@ let editScores = false;
 let manualSel = new Set();
 let fx = null;          // einmaliger Effekt beim nächsten Rendern
 let keyHandler = null;
+let lastTick = null;
+let manualEndPlayed = false;
+
+const EXTRA_MS = 10000;  // Zusatzzeit-Joker
+const GRACE_MS = 400;    // Toleranz für Antworten kurz vor Schluss
 
 // ---------------------------------------------------------------- Start / Ende
 
-export function createSession(quiz, mode) {
+export function createSession(quiz, mode, jokers = {}) {
   return {
-    v: 1,
+    v: 2,
     id: uid(),
     code: null,
     quiz: JSON.parse(JSON.stringify(quiz)),
@@ -29,6 +36,8 @@ export function createSession(quiz, mode) {
     players: {}, order: [], kicked: {},
     totals: {},                 // Spielpunkte aus den Vorrunden
     results: quiz.games.map(() => null),
+    jokerCfg: { double: jokers.double || 0, fifty: jokers.fifty || 0, time: jokers.time || 0 },
+    jl: {},                     // verbleibende Joker je Spieler
     phase: 'lobby',
     game: null, q: null, tie: null, final: null, manualTimer: null,
     usedTie: [], champion: null,
@@ -39,6 +48,8 @@ export async function startHost(root, makeCode) {
   S = await kvGet('session');
   if (!S) { location.hash = ''; return; }
   if (!S.code) { S.code = makeCode(); save(); }
+  S.jokerCfg = S.jokerCfg || { double: 0, fifty: 0, time: 0 };
+  S.jl = S.jl || {};
   document.body.classList.add('stage-mode');
   root.innerHTML = '<div class="stage" id="stage"></div><div class="controls" id="controls"></div>';
 
@@ -47,13 +58,19 @@ export async function startHost(root, makeCode) {
   intervals.push(setInterval(onTick, 200));
 
   keyHandler = e => {
+    unlockAudio();
     if (/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
+    const k = e.key.toLowerCase();
     if (e.key === ' ' || e.key === 'Enter' || e.key === 'ArrowRight') {
       const b = $('#primary');
       if (b && !b.disabled) { e.preventDefault(); b.click(); }
-    } else if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+    } else if (k === 'f') toggleFullscreen();
+    else if (k === 'm') command('mute');
+    else if (k === 'r' && buzzPending()) command('buzzRight');
+    else if (k === 'x' && buzzPending()) command('buzzWrong');
   };
   document.addEventListener('keydown', keyHandler);
+  document.addEventListener('click', unlockAudio, { once: true });
   render();
 }
 
@@ -75,31 +92,48 @@ function update() { save(); render(); broadcast(); }
 
 // ---------------------------------------------------------------- Hilfen
 
-const T = () => S.mode === 'team'
-  ? { one: 'Team', many: 'Teams' }
-  : { one: 'Spieler', many: 'Spieler' };
+const T = () => S.mode === 'team' ? { one: 'Team', many: 'Teams' } : { one: 'Spieler', many: 'Spieler' };
 const pids = () => S.order.filter(id => S.players[id] && !S.kicked[id]);
 const P = pid => S.players[pid] || { name: '?', color: '#888' };
 const nameOf = pid => P(pid).name;
 const curGame = () => (S.game ? S.quiz.games[S.game.idx] : null);
 const connected = pid => !!(net && net.isConnected(pid));
 const listNames = ids => ids.map(nameOf).join(' und ').replace(/ und (?=.* und )/g, ', ');
+const pointsLabel = n => `${n} ${Number(n) === 1 ? 'Punkt' : 'Punkte'}`;
+const shuffle = arr => { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 
-function chip(pid, extra = '') {
+function chip(pid, extra = '', suffix = '') {
   const p = P(pid);
-  return `<span class="chip ${extra}"><span class="sw" style="background:${p.color}"></span>${esc(p.name)}</span>`;
+  return `<span class="chip ${extra}"><span class="sw" style="background:${p.color}"></span>${esc(p.name)}${suffix}</span>`;
 }
 
 function nextUnplayed() { return S.results.findIndex(r => !r); }
+function rankedByTotals() { return pids().slice().sort((a, b) => (S.totals[b] || 0) - (S.totals[a] || 0)); }
 
-function rankedByTotals() {
-  return pids().slice().sort((a, b) => (S.totals[b] || 0) - (S.totals[a] || 0));
+// Zeitfenster einer Frage (mit Zusatzzeit-Joker)
+const qEnd = () => S.q.start + S.q.dur;
+const endFor = pid => qEnd() + ((S.q.extra && S.q.extra[pid]) || 0);
+const openFor = pid => !!(S.q && S.q.start && !S.q.locked && Date.now() <= endFor(pid) + GRACE_MS);
+const buzzPending = () => S && S.phase === 'q' && S.q && S.q.question.type === 'buzzer' && S.q.buzz && !S.q.buzzResult;
+
+function banner(text, color = 'var(--accent)') {
+  const el = document.createElement('div');
+  el.className = 'banner';
+  el.style.color = color;
+  el.textContent = text;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 1900);
+}
+
+function stopMedia() {
+  $$('#stage video, #stage audio').forEach(m => { try { m.pause(); } catch (e) { /* egal */ } });
+  const yt = $('#yt');
+  if (yt && yt.contentWindow) yt.contentWindow.postMessage(JSON.stringify({ event: 'command', func: 'pauseVideo', args: [] }), '*');
 }
 
 // ---------------------------------------------------------------- Netzwerk
 
 function onStatus(st) { netStatus = st; renderControls(); }
-
 function onLeave() { renderSoft(); }
 
 function onMessage(pid, msg) {
@@ -108,19 +142,23 @@ function onMessage(pid, msg) {
     if (!S.players[pid]) {
       let name = String(msg.name || '').trim().slice(0, 24) || `${T().one} ${S.order.length + 1}`;
       const taken = new Set(pids().map(nameOf));
-      let n = 2, base = name;
+      let n = 2; const base = name;
       while (taken.has(name)) name = `${base} ${n++}`;
       const color = PLAYER_COLORS[S.order.length % PLAYER_COLORS.length];
       S.players[pid] = { id: pid, name, color };
       S.order.push(pid);
       S.totals[pid] = S.totals[pid] || 0;
+      S.jl[pid] = { ...S.jokerCfg };
       if (S.final) initFinalPlayer(pid);
-      if (S.phase === 'lobby') toast(`${name} ist beigetreten`);
+      if (S.phase === 'lobby') { toast(`${name} ist beigetreten`); sfx('join'); }
     }
+    if (!S.jl[pid]) S.jl[pid] = { ...S.jokerCfg };
     update();
     return;
   }
   if (msg.t === 'answer') handleAnswer(pid, msg.qid, msg.value);
+  if (msg.t === 'buzz') handleBuzz(pid, msg.qid);
+  if (msg.t === 'joker') handleJoker(pid, msg.kind, msg.qid);
 }
 
 function broadcast() {
@@ -131,63 +169,166 @@ function broadcast() {
 // ---------------------------------------------------------------- Fragen
 
 function openQuestion(src, question, eligible) {
-  S.q = { src, question, eligible, answers: {}, start: Date.now(), dur: (Number(question.time) || 20) * 1000, locked: false, result: null };
+  const waiting = !!(question.media && question.mediaFirst);
+  S.q = {
+    src, question, eligible, answers: {}, start: waiting ? null : Date.now(),
+    dur: (Number(question.time) || 20) * 1000, locked: false, result: null,
+    fifty: {}, extra: {}, buzz: null, buzzResult: null,
+    shuffle: question.type === 'order' ? shuffle(orderIndices(question)) : null,
+  };
+  lastTick = null;
   S.phase = 'q';
+  if (!waiting) sfx('start');
+  update();
+}
+
+function releaseAnswers() {
+  if (S.phase !== 'q' || !S.q || S.q.start) return;
+  S.q.start = Date.now();
+  sfx('start');
+  update();
+}
+
+function lockQuestion(sound = true) {
+  if (S.q.locked) return;
+  S.q.locked = true;
+  if (sound) sfx('end');
   update();
 }
 
 function handleAnswer(pid, qid, value) {
   const q = S.q;
-  if (S.phase !== 'q' || !q || q.locked || q.question.id !== qid) return;
-  if (!q.eligible.includes(pid) || q.answers[pid]) return;
+  if (S.phase !== 'q' || !q || q.question.id !== qid || q.question.type === 'buzzer') return;
+  if (!q.eligible.includes(pid) || q.answers[pid] || !openFor(pid)) return;
   const qu = q.question;
   let v = value;
   if (qu.type === 'mc') { v = Number(v); if (!Number.isInteger(v) || !String(qu.options[v] || '').trim()) return; }
   else if (qu.type === 'tf') { if (typeof v !== 'boolean') return; }
-  else { v = Number(v); if (!Number.isFinite(v)) return; }
+  else if (qu.type === 'order') {
+    const valid = orderIndices(qu);
+    if (!Array.isArray(v) || v.length !== valid.length || [...v].sort((a, b) => a - b).join() !== valid.join()) return;
+    v = v.map(Number);
+  } else { v = Number(v); if (!Number.isFinite(v)) return; }
   q.answers[pid] = { v, ms: Date.now() - q.start };
   const waiting = q.eligible.filter(id => connected(id) && !q.answers[id]);
-  if (!waiting.length) q.locked = true;
+  if (!waiting.length) { q.locked = true; }
+  update();
+}
+
+function handleBuzz(pid, qid) {
+  const q = S.q;
+  if (S.phase !== 'q' || !q || q.question.id !== qid || q.question.type !== 'buzzer') return;
+  if (!q.start || q.locked || q.buzz || !q.eligible.includes(pid)) return;
+  q.buzz = pid;
+  q.buzzAt = Date.now() - q.start;
+  q.locked = true;
+  stopMedia();
+  sfx('buzz');
+  banner(`🔔 ${nameOf(pid)}`, P(pid).color);
+  update();
+}
+
+function handleJoker(pid, kind, qid) {
+  const left = S.jl[pid];
+  if (!left || !(left[kind] > 0) || !JOKERS[kind]) return;
+  if (kind === 'double') {
+    if (S.phase !== 'intro' || !S.game) return;
+    S.game.doubled = S.game.doubled || {};
+    if (S.game.doubled[pid]) return;
+    S.game.doubled[pid] = true;
+    banner(`⚡ ${nameOf(pid)} verdoppelt!`, P(pid).color);
+  } else {
+    const q = S.q;
+    if (S.phase !== 'q' || !q || q.question.id !== qid || q.src === 'tie') return;
+    if (!q.eligible.includes(pid) || q.answers[pid] || !openFor(pid)) return;
+    if (kind === 'fifty') {
+      if (q.question.type !== 'mc' || q.fifty[pid]) return;
+      const wrong = q.question.options.map((t, i) => ({ t, i })).filter(o => String(o.t).trim() && o.i !== q.question.correct).map(o => o.i);
+      const k = Math.floor((wrong.length + 1) / 2);
+      if (k < 1) return;
+      q.fifty[pid] = shuffle(wrong).slice(0, k);
+      banner(`½ ${nameOf(pid)}: 50:50`, P(pid).color);
+    }
+    if (kind === 'time') {
+      if (q.question.type === 'buzzer' || q.extra[pid]) return;
+      q.extra[pid] = EXTRA_MS;
+      banner(`⏱ ${nameOf(pid)}: +10 Sekunden`, P(pid).color);
+    }
+  }
+  left[kind]--;
+  sfx('joker');
   update();
 }
 
 function onTick() {
-  if (S.phase === 'q' && S.q && !S.q.locked) {
-    const rest = S.q.start + S.q.dur - Date.now();
-    if (rest <= 0) { S.q.locked = true; update(); return; }
+  if (!S) return;
+  if (S.phase === 'q' && S.q && S.q.start && !S.q.locked) {
+    const now = Date.now();
+    const main = qEnd() - now;
+    if (main <= 0) {
+      const extraPending = S.q.eligible.some(id => S.q.extra[id] && !S.q.answers[id] && now <= endFor(id));
+      if (!extraPending) { lockQuestion(true); return; }
+      const restExtra = Math.max(...S.q.eligible.filter(id => S.q.extra[id] && !S.q.answers[id]).map(id => endFor(id) - now));
+      const num = $('#tnum'); if (num) num.textContent = '+' + Math.ceil(restExtra / 1000);
+      const bar = $('#tbar'); if (bar) bar.style.transform = 'scaleX(0)';
+      return;
+    }
+    const sec = Math.ceil(main / 1000);
+    if (sec <= 5 && sec !== lastTick) { lastTick = sec; sfx('tick'); }
     const bar = $('#tbar'); const num = $('#tnum');
-    if (bar) bar.style.transform = `scaleX(${Math.max(0, rest / S.q.dur)})`;
-    if (num) num.textContent = Math.ceil(rest / 1000);
+    if (bar) bar.style.transform = `scaleX(${Math.max(0, main / S.q.dur)})`;
+    if (num) num.textContent = sec;
   }
   if (S.phase === 'manual' && S.manualTimer) {
     const rest = S.manualTimer.end - Date.now();
     const el = $('#mtimer');
+    const s = Math.max(0, Math.ceil(rest / 1000));
     if (el) {
-      const s = Math.max(0, Math.ceil(rest / 1000));
       el.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
       el.classList.toggle('low', s <= 5 && s > 0);
     }
+    if (s <= 5 && s > 0 && s !== lastTick) { lastTick = s; sfx('tick'); }
+    if (s === 0 && !manualEndPlayed) { manualEndPlayed = true; sfx('end'); }
   }
+}
+
+function isRight(qu, v) {
+  if (qu.type === 'order') return Array.isArray(v) && v.join() === orderIndices(qu).join();
+  return v === qu.correct;
 }
 
 function reveal() {
   const q = S.q, qu = q.question;
   q.locked = true;
+  stopMedia();
   let winners = [];
-  if (qu.type === 'estimate') {
+  if (qu.type === 'buzzer') {
+    if (q.buzz && q.buzzResult === 'right') winners = [q.buzz];
+  } else if (qu.type === 'estimate') {
     const arr = Object.entries(q.answers)
       .map(([pid, a]) => ({ pid, v: a.v, d: Math.abs(a.v - Number(qu.correct)), ms: a.ms }))
       .sort((a, b) => a.d - b.d || a.ms - b.ms);
     q.ranking = arr;
     if (arr.length) winners = arr.filter(x => x.d === arr[0].d).map(x => x.pid);
   } else {
-    winners = Object.entries(q.answers).filter(([, a]) => a.v === qu.correct).map(([pid]) => pid);
+    winners = Object.entries(q.answers).filter(([, a]) => isRight(qu, a.v)).map(([pid]) => pid);
   }
-  q.result = { winners };
-  if (q.src === 'game') winners.forEach(pid => { S.game.correct[pid] = (S.game.correct[pid] || 0) + 1; });
+  q.result = { winners, penalty: qu.type === 'buzzer' && q.buzzResult === 'wrong' ? [q.buzz] : [] };
+  if (q.src === 'game') {
+    winners.forEach(pid => { S.game.correct[pid] = (S.game.correct[pid] || 0) + 1; });
+    q.result.penalty.forEach(pid => { S.game.correct[pid] = (S.game.correct[pid] || 0) - 1; });
+  }
   if (q.src === 'final') applyFinal(q, winners);
   S.phase = 'reveal';
+  if (qu.type !== 'buzzer') sfx('reveal');
   update();
+}
+
+function judgeBuzz(right) {
+  if (!buzzPending()) return;
+  S.q.buzzResult = right ? 'right' : 'wrong';
+  sfx(right ? 'right' : 'wrong');
+  reveal();
 }
 
 function afterReveal() {
@@ -201,7 +342,7 @@ function afterReveal() {
 
 function startGame(idx) {
   if (S.results[idx]) return;
-  S.game = { idx, qi: -1, correct: {}, standings: null };
+  S.game = { idx, qi: -1, correct: {}, standings: null, doubled: {} };
   S.tie = null; S.q = null; S.manualTimer = null;
   manualSel = new Set();
   S.phase = 'intro';
@@ -232,12 +373,15 @@ function finishGameQuestions() {
 
 function awardGame(winners) {
   const g = curGame();
-  const pts = Number(g.points) || 0;
-  S.results[S.game.idx] = { winners, points: pts };
-  winners.forEach(pid => { S.totals[pid] = (S.totals[pid] || 0) + pts; });
+  const base = Number(g.points) || 0;
+  const dbl = S.game.doubled || {};
+  const pts = {};
+  winners.forEach(pid => { pts[pid] = base * (dbl[pid] ? 2 : 1); S.totals[pid] = (S.totals[pid] || 0) + pts[pid]; });
+  S.results[S.game.idx] = { winners, points: base, pts, doubled: Object.keys(dbl) };
   S.tie = null;
   S.phase = 'gameEnd';
   fx = 'confetti';
+  sfx('win');
   update();
 }
 
@@ -310,7 +454,18 @@ function nextFinalQuestion() {
 
 function applyFinal(q, winners) {
   const f = S.quiz.final, F = S.final;
-  if (f.winMode !== 'elimination') {
+  const elim = f.winMode === 'elimination';
+  if (q.question.type === 'buzzer') {
+    const wrong = q.result.penalty;
+    if (elim) wrong.forEach(pid => { F.lives[pid] = Math.max(0, (F.lives[pid] || 0) - 1); });
+    else {
+      winners.forEach(pid => { F.scores[pid] = (F.scores[pid] || 0) + 1; });
+      wrong.forEach(pid => { F.scores[pid] = Math.max(0, (F.scores[pid] || 0) - 1); });
+    }
+    q.result.lost = wrong;
+    return;
+  }
+  if (!elim) {
     winners.forEach(pid => { F.scores[pid] = (F.scores[pid] || 0) + 1; });
     q.result.lost = [];
     return;
@@ -383,6 +538,7 @@ function setChampion(pid) {
   S.finished = true;
   S.phase = 'end';
   fx = 'confetti-long';
+  sfx('win');
   update();
 }
 
@@ -397,9 +553,10 @@ function finalRanking() {
 function viewFor(pid) {
   const p = P(pid);
   const ranked = rankedByTotals();
+  const mine = S.totals[pid] || 0;
   const v = {
     phase: S.phase, mode: S.mode,
-    me: { name: p.name, color: p.color, total: S.totals[pid] || 0, rank: 1 + ranked.filter(o => (S.totals[o] || 0) > (S.totals[pid] || 0)).length, of: ranked.length },
+    me: { name: p.name, color: p.color, total: mine, rank: 1 + ranked.filter(o => (S.totals[o] || 0) > mine).length, of: ranked.length, jokers: S.jl[pid] || {} },
     icon: '🎲', title: '', sub: '',
   };
   const inFinal = S.final && (S.phase === 'finalIntro' || S.phase === 'end'
@@ -417,7 +574,9 @@ function viewFor(pid) {
     case 'board':
       Object.assign(v, { icon: '🎲', title: 'Spieltafel', sub: 'Gleich geht es weiter.' }); break;
     case 'intro':
-      Object.assign(v, { icon: '🎬', title: `Spiel ${S.game.idx + 1}: ${g.title}`, sub: `${g.description || ''}${g.description ? ' · ' : ''}Sieg: ${pointsLabel(g.points)}` }); break;
+      Object.assign(v, { icon: '🎬', title: `Spiel ${S.game.idx + 1}: ${g.title}`, sub: `${g.description || ''}${g.description ? ' · ' : ''}Sieg: ${pointsLabel(g.points)}` });
+      if (S.jokerCfg.double > 0) v.double = { left: (S.jl[pid] || {}).double || 0, used: !!(S.game.doubled && S.game.doubled[pid]) };
+      break;
     case 'manual':
       Object.assign(v, { icon: '🏁', title: g.title, sub: g.description || 'Der Spielleiter trägt den Sieger ein.' }); break;
     case 'tie':
@@ -425,22 +584,36 @@ function viewFor(pid) {
     case 'gameEnd': {
       const r = S.results[S.game.idx];
       const won = r && r.winners.includes(pid);
+      const got = r && r.pts ? r.pts[pid] : r && r.points;
       Object.assign(v, won
-        ? { icon: '🏆', title: 'Spiel gewonnen!', sub: `+${pointsLabel(r.points)}` }
+        ? { icon: '🏆', title: 'Spiel gewonnen!', sub: `+${pointsLabel(got)}${r.doubled && r.doubled.includes(pid) ? ' (verdoppelt ⚡)' : ''}` }
         : { icon: '👏', title: r ? `${listNames(r.winners)} gewinnt` : 'Spiel beendet', sub: g.title });
       break;
     }
     case 'finalIntro':
       Object.assign(v, { icon: '🔥', title: S.quiz.final.title || 'Finale', sub: v.final && v.final.lives !== undefined ? `Deine Leben: ${v.final.lives}` : `Dein Startwert: ${v.final ? v.final.score : 0}` }); break;
     case 'q': {
-      const q = S.q;
+      const q = S.q, qu = q.question;
       if (q.eligible.includes(pid)) {
-        const qu = q.question;
+        const now = Date.now();
+        const left = S.jl[pid] || {};
+        const open = openFor(pid);
+        const removed = q.fifty[pid] || [];
         v.q = {
           id: qu.id, type: qu.type, text: qu.text, unit: qu.unit || '',
-          options: qu.type === 'mc' ? qu.options.map((t, i) => ({ i, t })).filter(o => String(o.t).trim()) : null,
-          remaining: q.locked ? 0 : Math.max(0, q.start + q.dur - Date.now()), dur: q.dur,
-          answered: !!q.answers[pid], locked: q.locked,
+          options: qu.type === 'mc' ? qu.options.map((t, i) => ({ i, t })).filter(o => String(o.t).trim() && !removed.includes(o.i)) : null,
+          items: qu.type === 'order' ? q.shuffle.map(i => ({ i, t: qu.items[i] })) : null,
+          waiting: !q.start,
+          remaining: q.start ? Math.max(0, endFor(pid) - now) : 0,
+          dur: q.dur + (q.extra[pid] || 0),
+          answered: !!q.answers[pid],
+          locked: !!q.start && !open,
+          buzz: qu.type === 'buzzer' && q.buzz ? { me: q.buzz === pid, name: nameOf(q.buzz) } : null,
+          usedFifty: !!q.fifty[pid], usedTime: !!q.extra[pid],
+          jokers: q.src !== 'tie' && open && !q.answers[pid] ? {
+            fifty: qu.type === 'mc' && !q.fifty[pid] ? left.fifty || 0 : 0,
+            time: qu.type !== 'buzzer' && !q.extra[pid] ? left.time || 0 : 0,
+          } : null,
         };
       } else if (q.src === 'tie') {
         Object.assign(v, { icon: '⏳', title: 'Stechen läuft', sub: `zwischen ${listNames(q.eligible)}` });
@@ -455,12 +628,15 @@ function viewFor(pid) {
       const q = S.q, qu = q.question;
       const a = q.answers[pid];
       v.r = {
+        type: qu.type,
         eligible: q.eligible.includes(pid),
-        answered: !!a,
+        answered: qu.type === 'buzzer' ? q.buzz === pid : !!a,
         good: q.result.winners.includes(pid),
         solution: correctText(qu),
         mine: a ? answerText(qu, a.v) : null,
-        lostLife: (q.result.lost || []).includes(pid),
+        lostLife: (q.result.lost || []).includes(pid) && S.quiz.final.winMode === 'elimination' && q.src === 'final',
+        penalty: (q.result.penalty || []).includes(pid),
+        buzzName: q.buzz ? nameOf(q.buzz) : null,
       };
       break;
     }
@@ -479,18 +655,18 @@ function viewFor(pid) {
 function answerText(qu, v) {
   if (qu.type === 'mc') return qu.options[v];
   if (qu.type === 'tf') return v ? 'Wahr' : 'Falsch';
+  if (qu.type === 'order') return v.map(i => qu.items[i]).join(' → ');
   return formatNumber(v) + (qu.unit ? ' ' + qu.unit : '');
 }
-
-const pointsLabel = n => `${n} ${Number(n) === 1 ? 'Punkt' : 'Punkte'}`;
 
 // ---------------------------------------------------------------- Rendern
 
 let lastStageKey = null;
 
-// Gleiche Bühne wie zuvor? Dann nur Teile aktualisieren, damit Animationen nicht neu starten.
+// Gleiche Bühne wie zuvor? Dann nur Teile aktualisieren, damit Animationen und Videos nicht neu starten.
 function stageKey() {
-  if (S.phase === 'q') return `q|${S.q.question.id}|${S.q.start}|${S.q.locked}`;
+  if (S.phase === 'q') return `q|${S.q.question.id}|${S.q.src}`;
+  if (S.phase === 'intro') return `intro|${S.game.idx}`;
   if (S.phase === 'lobby') return 'lobby';
   return null;
 }
@@ -501,15 +677,17 @@ function render() {
   const key = stageKey();
   if (key && key === lastStageKey) {
     if (S.phase === 'q') {
-      const c = $('#answered-chips'); if (c) c.outerHTML = answeredChips();
-      const n = $('#answered-count'); if (n) n.textContent = `${Object.keys(S.q.answers).length} / ${S.q.eligible.length} geantwortet`;
+      const d = $('#q-dyn'); if (d) d.innerHTML = qDynamic();
+      const n = $('#answered-count'); if (n) n.textContent = countLabel();
     }
+    if (S.phase === 'intro') { const j = $('#joker-row'); if (j) j.innerHTML = doubledRow(); }
     if (S.phase === 'lobby') {
       const c = $('#lobby-chips'); if (c) c.innerHTML = lobbyChips();
       const n = $('#lobby-count'); if (n) n.textContent = `(${pids().length})`;
-      bindStage();
     }
+    bindStage();
     renderControls();
+    onTick();
     return;
   }
   lastStageKey = key;
@@ -521,11 +699,21 @@ function render() {
   bindStage();
   renderControls();
   if (S.phase === 'lobby') drawQR();
+  if (S.phase === 'q') attachMedia(stage);
   onTick();
   if (fx) { confetti(fx === 'confetti-long' ? 5000 : 2500); fx = null; }
 }
 
-// Nur kleine Teile neu zeichnen (z. B. Verbindungsstatus), ohne Animationen neu zu starten.
+function attachMedia(stage) {
+  hydrateMedia(stage).then(() => {
+    $$('video, audio', stage).forEach(m => {
+      m.onended = () => releaseAnswers();
+      const p = m.play();
+      if (p && p.catch) p.catch(() => toast('Zum Abspielen auf ▶ klicken (Browser blockiert Autoplay).', 3500));
+    });
+  });
+}
+
 function renderSoft() {
   if (S.phase === 'lobby') { const c = $('#lobby-chips'); if (c) c.innerHTML = lobbyChips(); bindStage(); }
   renderControls();
@@ -535,9 +723,7 @@ function top(left, right = '') {
   return `<div class="stage-top"><div>${left}</div><div>${right}</div></div>`;
 }
 
-function joinUrl() {
-  return new URL('play.html?r=' + S.code, location.href).href;
-}
+function joinUrl() { return new URL('play.html?r=' + S.code, location.href).href; }
 
 function lobbyChips() {
   const list = pids();
@@ -545,16 +731,21 @@ function lobbyChips() {
   return list.map(pid => `<span class="chip ${connected(pid) ? '' : 'off'}"><span class="sw" style="background:${P(pid).color}"></span>${esc(nameOf(pid))}<button data-kick="${pid}" title="Entfernen">✕</button></span>`).join('');
 }
 
+function jokerSummary() {
+  const parts = Object.entries(JOKERS).filter(([k]) => S.jokerCfg[k] > 0).map(([k, j]) => `${j.icon} ${j.label} ×${S.jokerCfg[k]}`);
+  return parts.length ? `Joker pro ${T().one}: ${parts.join(' · ')}` : '';
+}
+
 function renderLobby() {
   const local = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
-  return `${top(`<b>${esc(S.quiz.title)}</b> · ${S.mode === 'team' ? 'Teammodus' : 'Einzelmodus'}`)}
+  return `${top(`<b>${esc(S.quiz.title)}</b> · ${S.mode === 'team' ? 'Teammodus' : 'Einzelmodus'}`, esc(jokerSummary()))}
   <div class="lobby">
     <div style="text-align:center">
       <div class="qrbox" id="qr"></div>
       <div class="mid" style="margin-top:2vh">Code</div>
       <div class="joincode">${S.code}</div>
       <div class="joinurl">${esc(joinUrl())}</div>
-      ${local ? `<div class="notice" style="margin-top:2vh;text-align:left;font-size:.9rem">Lokaler Test: Handys erreichen „localhost“ nicht. Öffne zum Testen Spieler-Tabs über den Button unten. Am Spieleabend läuft die App über die Internetadresse.</div>` : ''}
+      ${local ? `<div class="notice" style="margin-top:2vh;text-align:left;font-size:.9rem">Lokaler Test: Handys erreichen „localhost“ nicht. Öffne zum Testen Spieler-Tabs über den Button unten.</div>` : ''}
     </div>
     <div>
       <div class="big">${S.mode === 'team' ? 'Teams' : 'Spieler'} <span class="muted" id="lobby-count">(${pids().length})</span></div>
@@ -571,13 +762,20 @@ function drawQR() {
   new QRCode(el, { text: joinUrl(), width: 512, height: 512, correctLevel: QRCode.CorrectLevel.M });
 }
 
+function jokerIcons(pid) {
+  const l = S.jl[pid];
+  if (!l) return '';
+  const s = Object.entries(JOKERS).filter(([k]) => S.jokerCfg[k] > 0).map(([k, j]) => `<span class="jk ${l[k] > 0 ? '' : 'used'}">${j.icon}${l[k] > 1 ? l[k] : ''}</span>`).join('');
+  return s ? `<span class="jks">${s}</span>` : '';
+}
+
 function scoresPanel(title = 'Gesamtstand') {
   const ranked = rankedByTotals();
   const max = ranked.length ? S.totals[ranked[0]] || 0 : 0;
   return `<div class="scores ${editScores ? 'editing' : ''}"><h3>${title}</h3>
     ${ranked.map((pid, i) => `<div class="srow ${max > 0 && (S.totals[pid] || 0) === max ? 'lead' : ''}">
       <span class="rk">${i + 1}.</span>
-      <span class="nm"><span class="sw dot" style="background:${P(pid).color}"></span>${esc(nameOf(pid))}</span>
+      <span class="nm"><span class="sw dot" style="background:${P(pid).color}"></span>${esc(nameOf(pid))}${jokerIcons(pid)}</span>
       <span class="row" style="gap:6px;align-items:center"><span class="adj"><button data-adj="${pid}" data-d="-1">−</button><button data-adj="${pid}" data-d="1">+</button></span><span class="val">${S.totals[pid] || 0}</span></span>
     </div>`).join('') || '<span class="muted">Keine Mitspieler</span>'}</div>`;
 }
@@ -589,8 +787,9 @@ function renderBoard() {
     const r = S.results[i];
     if (r) {
       const p = P(r.winners[0]);
+      const got = r.pts ? r.pts[r.winners[0]] : r.points;
       return `<div class="tile done" style="border-color:${p.color};background:${p.color}22">
-        <span class="pts">${r.points} P</span><span class="n" style="color:${p.color}">${i + 1}</span>
+        <span class="pts">${got} P${r.doubled && r.doubled.includes(r.winners[0]) ? ' ⚡' : ''}</span><span class="n" style="color:${p.color}">${i + 1}</span>
         <span class="w">${esc(g.title)}</span><span class="w" style="color:${p.color}">${esc(listNames(r.winners))}</span></div>`;
     }
     return `<div class="tile ${i === next ? 'next' : ''}" data-game="${i}"><span class="pts">${g.points} P</span><span class="n">${i + 1}</span><span class="w muted">?</span></div>`;
@@ -601,6 +800,12 @@ function renderBoard() {
     <div class="board"><div class="tiles">${tiles}${finalTile}</div>${scoresPanel()}</div>`;
 }
 
+function doubledRow() {
+  const d = Object.keys((S.game && S.game.doubled) || {});
+  if (!d.length) return S.jokerCfg.double > 0 ? '<span class="muted">Jetzt kann der Verdoppeln-Joker am Handy gesetzt werden.</span>' : '';
+  return d.map(pid => chip(pid, 'doubled', ' ⚡ ×2')).join('');
+}
+
 function renderIntro() {
   const g = curGame();
   return `${top(`<b>${esc(S.quiz.title)}</b>`, `Spiel ${S.game.idx + 1} / ${S.quiz.games.length}`)}
@@ -609,6 +814,7 @@ function renderIntro() {
     <div class="huge intro-title">${esc(g.title)}</div>
     ${g.description ? `<div class="mid intro-desc">${esc(g.description)}</div>` : ''}
     <div class="mid intro-pts">Sieg: ${pointsLabel(g.points)}${g.type === 'quiz' ? ` · ${g.questions.length} Fragen` : ''}</div>
+    <div class="chips" id="joker-row" style="justify-content:center;margin-top:3vh">${doubledRow()}</div>
   </div>`;
 }
 
@@ -619,10 +825,26 @@ function qLabel() {
   return `<b>${esc(S.quiz.final.title || 'Finale')}</b> · Frage ${S.final.qi + 1}`;
 }
 
-function questionHead() {
-  const qu = S.q.question;
-  return `<div class="qtext">${esc(qu.text)}</div>
-    ${qu.image ? `<div class="qimg"><img src="${qu.image}" alt=""></div>` : '<div style="flex:1"></div>'}`;
+function countLabel() {
+  const q = S.q;
+  if (q.question.type === 'buzzer') return 'Buzzer-Frage';
+  return `${Object.keys(q.answers).length} / ${q.eligible.length} geantwortet`;
+}
+
+function mediaBlock(qu) {
+  const m = qu.media;
+  if (m && m.kind === 'file') {
+    if ((m.mime || '').startsWith('audio')) {
+      return `<div class="qmedia audio"><div class="speaker">🔊</div><audio data-media="${m.id}" controls></audio></div>`;
+    }
+    return `<div class="qmedia"><video data-media="${m.id}" controls playsinline></video></div>`;
+  }
+  if (m && m.kind === 'youtube' && m.vid) {
+    const params = `autoplay=1&enablejsapi=1&rel=0&modestbranding=1&start=${Number(m.start) || 0}${Number(m.end) ? `&end=${Number(m.end)}` : ''}`;
+    return `<div class="qmedia"><iframe id="yt" src="https://www.youtube-nocookie.com/embed/${encodeURIComponent(m.vid)}?${params}" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe></div>`;
+  }
+  if (qu.image) return `<div class="qimg"><img src="${qu.image}" alt=""></div>`;
+  return '<div style="flex:1"></div>';
 }
 
 function optionTiles(reveal) {
@@ -637,21 +859,46 @@ function optionTiles(reveal) {
   }).join('')}</div>`;
 }
 
-function answeredChips() {
-  const q = S.q;
-  return `<div class="chips answered-row" id="answered-chips">${q.eligible.map(pid => chip(pid, `${q.answers[pid] ? 'answered' : ''} ${connected(pid) ? '' : 'off'}`)).join('')}</div>`;
+function typeBlock(qu) {
+  if (qu.type === 'mc' || qu.type === 'tf') return optionTiles(false);
+  if (qu.type === 'estimate') return `<div class="center" style="flex:none"><div class="big muted">Schätzt! ${qu.unit ? `(in ${esc(qu.unit)})` : ''}</div></div>`;
+  if (qu.type === 'order') {
+    return `<div class="order-list">${S.q.shuffle.map((i, k) => `<div class="order-item" style="animation-delay:${k * 0.08}s">${esc(qu.items[i])}</div>`).join('')}</div>
+      <div class="muted" style="text-align:center">Bringt die Einträge am Handy in die richtige Reihenfolge.</div>`;
+  }
+  return '';
+}
+
+function qDynamic() {
+  const q = S.q, qu = q.question;
+  if (!q.start) {
+    return `<div class="wait-msg mid">${qu.media && qu.media.kind === 'youtube' ? '▶ Schaut genau hin …' : '👀 Gut aufpassen …'} Die Antworten werden gleich freigegeben.</div>`;
+  }
+  const timer = `<div class="timer-row"><div class="timer"><i id="tbar" ${q.locked ? 'style="transform:scaleX(0)"' : ''}></i></div><div class="timer-num" id="tnum">${q.locked ? '0' : ''}</div></div>`;
+  if (qu.type === 'buzzer') {
+    if (q.buzz) {
+      const p = P(q.buzz);
+      return `<div class="buzz-box" style="border-color:${p.color}"><div class="huge" style="color:${p.color}">🔔 ${esc(p.name)}</div>
+        <div class="mid muted">hat gebuzzert – Antwort bitte laut!</div></div>`;
+    }
+    return `${timer}<div class="buzz-ready ${q.locked ? 'off' : ''}">${q.locked ? 'Niemand hat gebuzzert' : '🔔 Buzzer frei!'}</div>`;
+  }
+  const extra = Object.keys(q.extra || {});
+  const fifty = Object.keys(q.fifty || {});
+  const chips = q.eligible.map(pid => chip(pid, `${q.answers[pid] ? 'answered' : ''} ${connected(pid) ? '' : 'off'}`,
+    `${fifty.includes(pid) ? ' ½' : ''}${extra.includes(pid) ? ' ⏱' : ''}`)).join('');
+  return `${timer}<div class="chips answered-row" id="answered-chips">${chips}</div>
+    ${q.locked ? '<div class="center" style="flex:none"><div class="mid" style="color:var(--accent)">Antworten geschlossen – bereit zur Auflösung</div></div>' : ''}`;
 }
 
 function renderQuestion() {
-  const q = S.q, qu = q.question;
-  const n = Object.keys(q.answers).length;
-  return `${top(qLabel(), `<span id="answered-count">${n} / ${q.eligible.length} geantwortet</span>`)}
+  const qu = S.q.question;
+  return `${top(qLabel(), `<span id="answered-count">${countLabel()}</span>`)}
   <div class="qwrap">
-    ${questionHead()}
-    ${qu.type === 'estimate' ? `<div class="center" style="flex:none"><div class="big muted">Schätzt! ${qu.unit ? `(in ${esc(qu.unit)})` : ''}</div></div>` : optionTiles(false)}
-    <div class="timer-row"><div class="timer"><i id="tbar" ${q.locked ? 'style="transform:scaleX(0)"' : ''}></i></div><div class="timer-num" id="tnum">${q.locked ? '0' : ''}</div></div>
-    ${answeredChips()}
-    ${q.locked ? '<div class="center" style="flex:none"><div class="mid" style="color:var(--accent)">Antworten geschlossen – bereit zur Auflösung</div></div>' : ''}
+    <div class="qtext">${esc(qu.text)}</div>
+    ${mediaBlock(qu)}
+    ${typeBlock(qu)}
+    <div id="q-dyn" class="q-dyn">${qDynamic()}</div>
   </div>`;
 }
 
@@ -663,13 +910,22 @@ function renderReveal() {
       <span>${chip(x.pid)}</span><span>${formatNumber(x.v)} ${esc(qu.unit || '')}</span><span class="diff">±${formatNumber(x.d)}</span></div>`).join('');
     body = `<div class="estimate-box"><div class="big">Lösung: <span class="solution">${esc(correctText(qu))}</span></div></div>
       <div class="est-list">${rows || '<div class="muted mid" style="text-align:center">Keine Antworten</div>'}</div>`;
+  } else if (qu.type === 'order') {
+    body = `<div class="order-list solution-list">${orderIndices(qu).map((i, k) => `<div class="order-item right" style="animation-delay:${k * 0.15}s"><b>${k + 1}.</b> ${esc(qu.items[i])}</div>`).join('')}</div>`;
+  } else if (qu.type === 'buzzer') {
+    const verdict = q.buzz
+      ? (q.buzzResult === 'right'
+        ? `<div class="big" style="color:var(--good)">✓ ${esc(nameOf(q.buzz))} lag richtig!</div>`
+        : `<div class="big" style="color:var(--bad)">✗ ${esc(nameOf(q.buzz))} lag falsch – Minuspunkt</div>`)
+      : '<div class="big muted">Niemand hat gebuzzert</div>';
+    body = `<div class="estimate-box"><div class="big">Lösung: <span class="solution">${esc(correctText(qu))}</span></div></div><div class="center" style="flex:none">${verdict}</div>`;
   } else {
     body = optionTiles(true);
   }
   return `${top(qLabel(), 'Auflösung')}
   <div class="qwrap">
     <div class="qtext">${esc(qu.text)}</div>
-    ${qu.image && qu.type !== 'estimate' ? `<div class="qimg"><img src="${qu.image}" alt=""></div>` : ''}
+    ${qu.image && !qu.media && (qu.type === 'mc' || qu.type === 'tf') ? `<div class="qimg"><img src="${qu.image}" alt=""></div>` : ''}
     ${body}
     ${revealFooter()}
   </div>`;
@@ -679,7 +935,10 @@ function revealFooter() {
   const q = S.q;
   if (q.src === 'game') {
     const g = curGame();
-    return `<div class="chips answered-row">${pids().map(pid => `<span class="chip ${q.result.winners.includes(pid) ? 'answered' : ''}"><span class="sw" style="background:${P(pid).color}"></span>${esc(nameOf(pid))} <b>${S.game.correct[pid] || 0}</b></span>`).join('')}</div>
+    return `<div class="chips answered-row">${pids().map(pid => {
+      const cls = q.result.winners.includes(pid) ? 'answered' : (q.result.penalty || []).includes(pid) ? 'penalty' : '';
+      return `<span class="chip ${cls}"><span class="sw" style="background:${P(pid).color}"></span>${esc(nameOf(pid))} <b>${S.game.correct[pid] || 0}</b></span>`;
+    }).join('')}</div>
       <div class="muted" style="text-align:center">Richtige Antworten in „${esc(g.title)}“</div>`;
   }
   if (q.src === 'final') return finalBar(q.result);
@@ -705,13 +964,14 @@ function renderManual() {
   const g = curGame();
   const t = Number(g.timer) || 0;
   const timerHtml = t ? `<div class="big-timer" id="mtimer">${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}</div>` : '';
+  const dbl = Object.keys(S.game.doubled || {});
   return `${top(`<b>${esc(g.title)}</b> · Spiel ${S.game.idx + 1}`, `Sieg: ${pointsLabel(g.points)}`)}
   <div class="center">
     <div class="big">${esc(g.title)}</div>
     ${g.description ? `<div class="mid muted" style="max-width:70vw;margin-top:1vh">${esc(g.description)}</div>` : ''}
     <div style="margin:3vh 0">${timerHtml}</div>
     <div class="mid muted">Sieger antippen:</div>
-    <div class="pick-grid">${pids().map(pid => `<button class="pick ${manualSel.has(pid) ? 'sel' : ''}" data-pick="${pid}" style="box-shadow:inset 0 -5px 0 ${P(pid).color}">${esc(nameOf(pid))}</button>`).join('')}</div>
+    <div class="pick-grid">${pids().map(pid => `<button class="pick ${manualSel.has(pid) ? 'sel' : ''}" data-pick="${pid}" style="box-shadow:inset 0 -5px 0 ${P(pid).color}">${esc(nameOf(pid))}${dbl.includes(pid) ? ' ⚡' : ''}</button>`).join('')}</div>
   </div>`;
 }
 
@@ -740,11 +1000,14 @@ function renderGameEnd() {
     ? `<div class="result-list">${S.game.standings.map(x => `<div class="srow ${r.winners.includes(x.pid) ? 'lead' : ''}"><span class="rk"></span><span class="nm">${chip(x.pid)}</span><span class="val">${x.n} richtig</span></div>`).join('')}</div>`
     : '';
   const p = P(r.winners[0]);
+  const got = r.pts ? r.pts[r.winners[0]] : r.points;
+  const doubled = r.doubled && r.doubled.includes(r.winners[0]);
   return `${top(`<b>${esc(g.title)}</b> · Spiel ${S.game.idx + 1}`, 'Ergebnis')}
   <div class="center">
     <div class="crown">🏆</div>
     <div class="huge winner-name" style="color:${p.color}">${esc(listNames(r.winners))}</div>
-    <div class="big">gewinnt „${esc(g.title)}“ · +${pointsLabel(r.points)}</div>
+    <div class="big">gewinnt „${esc(g.title)}“ · +${pointsLabel(got)}</div>
+    ${doubled ? '<div class="mid doubled-note">⚡ Verdoppeln-Joker hat gezündet!</div>' : ''}
     ${standings}
   </div>`;
 }
@@ -831,8 +1094,7 @@ function renderControls() {
       btns.push(`<button class="btn small ghost" data-c="editScores">${editScores ? 'Korrektur fertig' : 'Punkte korrigieren'}</button>`);
       const next = nextUnplayed();
       primary = S.finished ? { label: 'Zur Siegerehrung', c: 'toEnd' }
-        : next >= 0
-          ? { label: `Spiel ${next + 1} starten`, c: 'nextGame' }
+        : next >= 0 ? { label: `Spiel ${next + 1} starten`, c: 'nextGame' }
           : { label: S.quiz.final.enabled ? 'Zum Finale' : 'Zur Siegerehrung', c: 'finish' };
       break;
     }
@@ -841,7 +1103,13 @@ function renderControls() {
       primary = { label: g.type === 'manual' ? 'Spiel beginnen' : 'Erste Frage', c: 'beginGame' };
       break;
     case 'q':
-      if (!S.q.locked) btns.push(`<button class="btn small ghost" data-c="lock">Antworten schließen</button>`);
+      if (!S.q.start) { primary = { label: 'Antworten freigeben', c: 'release' }; break; }
+      if (buzzPending()) {
+        btns.push(`<button class="btn judge good" data-c="buzzRight">✓ Richtig <span class="kbd">R</span></button>`);
+        btns.push(`<button class="btn judge bad" data-c="buzzWrong">✗ Falsch <span class="kbd">X</span></button>`);
+        break;
+      }
+      if (!S.q.locked) btns.push(`<button class="btn small ghost" data-c="lock">${S.q.question.type === 'buzzer' ? 'Buzzer schließen' : 'Antworten schließen'}</button>`);
       primary = { label: 'Auflösen', c: 'reveal' };
       break;
     case 'reveal': {
@@ -876,6 +1144,7 @@ function renderControls() {
     <span class="status"><span class="dot ${dot}"></span>${stLabel} · ${n} verbunden · Code <b>${S.code}</b></span>
     ${btns.join('')}
     <span class="spacer"></span>
+    <button class="btn small ghost" data-c="mute" title="Ton an/aus (M)">${isMuted() ? '🔇' : '🔊'}</button>
     <button class="btn small ghost" data-c="fullscreen" title="Vollbild (F)">⛶</button>
     <button class="btn small danger" data-c="quit">Abend beenden</button>
     ${primary ? `<button class="btn primary" id="primary" data-c="${primary.c}" ${primary.disabled ? 'disabled' : ''}>${primary.label}<span class="kbd">Leertaste</span></button>` : ''}`;
@@ -886,7 +1155,7 @@ function renderControls() {
 function command(c) {
   switch (c) {
     case 'testplayer': window.open('play.html?r=' + S.code + '&test=' + Date.now(), '_blank'); break;
-    case 'toBoard': S.phase = 'board'; S.q = null; update(); break;
+    case 'toBoard': stopMedia(); S.phase = 'board'; S.q = null; update(); break;
     case 'toBoardFromEnd': S.phase = 'board'; update(); break;
     case 'toEnd': S.phase = 'end'; update(); break;
     case 'lobby': S.phase = 'lobby'; update(); break;
@@ -894,14 +1163,18 @@ function command(c) {
     case 'nextGame': startGame(nextUnplayed()); break;
     case 'finish': toFinish(); break;
     case 'beginGame': beginGame(); break;
-    case 'lock': S.q.locked = true; update(); break;
+    case 'release': releaseAnswers(); break;
+    case 'lock': lockQuestion(true); break;
     case 'reveal': reveal(); break;
+    case 'buzzRight': judgeBuzz(true); break;
+    case 'buzzWrong': judgeBuzz(false); break;
     case 'afterReveal': afterReveal(); break;
-    case 'mtimer': S.manualTimer = { end: Date.now() + Number(curGame().timer) * 1000 }; update(); break;
+    case 'mtimer': S.manualTimer = { end: Date.now() + Number(curGame().timer) * 1000 }; manualEndPlayed = false; lastTick = null; sfx('start'); update(); break;
     case 'manualWin': awardGame([...manualSel]); break;
     case 'manualTie': S.tie = { context: 'game', pids: [...manualSel] }; S.phase = 'tie'; update(); break;
     case 'startTie': startTie(); break;
     case 'nextFinal': nextFinalQuestion(); break;
+    case 'mute': toggleMute(); renderControls(); break;
     case 'fullscreen': toggleFullscreen(); break;
     case 'quit':
       if (!confirm('Abend wirklich beenden? Der Spielstand wird gelöscht.')) return;

@@ -6,6 +6,14 @@ export const QUESTION_TYPES = {
   mc: 'Multiple Choice',
   tf: 'Wahr / Falsch',
   estimate: 'Schätzfrage',
+  order: 'Reihenfolge',
+  buzzer: 'Buzzer-Frage',
+};
+
+export const JOKERS = {
+  double: { label: 'Verdoppeln', icon: '⚡', hint: 'Nach der Spielankündigung: Sieg zählt doppelt' },
+  fifty: { label: '50:50', icon: '½', hint: 'Multiple Choice: falsche Antworten verschwinden' },
+  time: { label: 'Zusatzzeit', icon: '⏱', hint: '10 Sekunden mehr Zeit bei einer Frage' },
 };
 
 export const WIN_MODES = {
@@ -15,12 +23,26 @@ export const WIN_MODES = {
 };
 
 export function newQuestion(type = 'mc') {
-  const q = { id: uid(), type, text: '', image: null, time: 20 };
+  // media: null | {kind:'file', id, mime, name, size} | {kind:'youtube', url, vid, start, end}
+  const q = { id: uid(), type, text: '', image: null, media: null, mediaFirst: false, time: 20 };
   if (type === 'mc') { q.options = ['', '', '', '']; q.correct = 0; }
   if (type === 'tf') { q.correct = true; }
   if (type === 'estimate') { q.correct = 0; q.unit = ''; q.time = 30; }
+  if (type === 'order') { q.items = ['', '', '', '']; q.time = 30; } // Einträge in richtiger Reihenfolge
+  if (type === 'buzzer') { q.answer = ''; q.time = 30; }
   return q;
 }
+
+// YouTube-Link zerlegen: Video-ID und Startzeit (t=…)
+export function parseYouTube(url) {
+  const s = String(url || '').trim();
+  const m = s.match(/(?:youtu\.be\/|v=|\/embed\/|\/shorts\/|\/live\/)([A-Za-z0-9_-]{11})/) || s.match(/^([A-Za-z0-9_-]{11})$/);
+  if (!m) return null;
+  const t = s.match(/[?&](?:t|start)=(\d+)/);
+  return { vid: m[1], start: t ? Number(t[1]) : 0 };
+}
+
+export const orderIndices = q => (q.items || []).map((t, i) => (String(t).trim() ? i : -1)).filter(i => i >= 0);
 
 export function newGame(n = 1, type = 'quiz') {
   return {
@@ -108,12 +130,17 @@ function checkQuestion(q, label, w) {
     if (filled < 2) w.push(`${label}: mindestens zwei Antworten nötig.`);
     if (!q.options[q.correct] || !q.options[q.correct].trim()) w.push(`${label}: die richtige Antwort ist leer.`);
   }
+  if (q.type === 'order' && orderIndices(q).length < 2) w.push(`${label}: mindestens zwei Einträge für die Reihenfolge nötig.`);
+  if (q.type === 'buzzer' && !String(q.answer || '').trim()) w.push(`${label}: Lösung fehlt (wird bei der Auflösung gezeigt).`);
+  if (q.media && q.media.kind === 'youtube' && !q.media.vid) w.push(`${label}: YouTube-Link ist ungültig.`);
 }
 
 // Text der richtigen Antwort (für Anzeige).
 export function correctText(q) {
   if (q.type === 'mc') return q.options[q.correct];
   if (q.type === 'tf') return q.correct ? 'Wahr' : 'Falsch';
+  if (q.type === 'order') return orderIndices(q).map(i => q.items[i]).join(' → ');
+  if (q.type === 'buzzer') return q.answer || '–';
   return formatNumber(q.correct) + (q.unit ? ' ' + q.unit : '');
 }
 
@@ -167,5 +194,44 @@ export function sampleQuiz() {
     est('In welchem Jahr landete Apollo 11 auf dem Mond?', 1969),
     est('Wie schnell ist Schall in Luft bei 20 °C?', 343, 'm/s'),
   ];
+  return q;
+}
+
+// Zweites Beispiel mit den Funktionen aus Stufe 2.
+export function sampleQuiz2() {
+  const ord = (text, items) => Object.assign(newQuestion('order'), { text, items });
+  const buz = (text, answer) => Object.assign(newQuestion('buzzer'), { text, answer, time: 20 });
+  const mc = (text, options, correct) => Object.assign(newQuestion('mc'), { text, options, correct });
+  const est = (text, correct, unit = '') => Object.assign(newQuestion('estimate'), { text, correct, unit });
+
+  const q = newQuiz('Beispiel: Neue Funktionen', 0);
+  q.games = [
+    Object.assign(newGame(1), {
+      title: 'Zeitstrahl', description: 'Bringt alles in die richtige Reihenfolge.',
+      questions: [
+        ord('Sortiere nach Gründungsjahr (älteste zuerst).', ['Google', 'Facebook', 'YouTube', 'WhatsApp']),
+        ord('Sortiere nach Größe (kleinster zuerst).', ['Mond', 'Erde', 'Jupiter', 'Sonne']),
+        mc('Welcher Planet hat die meisten bekannten Monde?', ['Erde', 'Mars', 'Saturn', 'Merkur'], 2),
+      ],
+    }),
+    Object.assign(newGame(2), {
+      title: 'Schnellraten', description: 'Buzzer-Runde: Wer zuerst drückt, antwortet laut. Falsch = Minuspunkt.',
+      questions: [
+        buz('Wie heißt die Hauptstadt von Kanada?', 'Ottawa'),
+        buz('Wie viele Bundesländer hat Deutschland?', '16'),
+        buz('Welches Tier ist im Berliner Wappen?', 'Bär'),
+      ],
+      tiebreaker: est('Wie viele Einwohner hat Deutschland ungefähr (in Millionen)?', 83, 'Mio.'),
+    }),
+  ];
+  q.final = Object.assign(newFinal(), {
+    winMode: 'count', count: 3, description: '',
+    questions: [
+      mc('Wie viele Minuten hat ein Tag?', ['1.240', '1.440', '1.640', '1.840'], 1),
+      ord('Sortiere von Norden nach Süden.', ['Hamburg', 'Kassel', 'Frankfurt', 'München']),
+      buz('Wie heißt der längste Fluss der Welt?', 'Nil (je nach Messung auch Amazonas)'),
+    ],
+  });
+  q.tiebreakers = [est('Wie hoch ist der Kölner Dom?', 157, 'm')];
   return q;
 }
