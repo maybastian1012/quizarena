@@ -3,6 +3,17 @@ const DB_NAME = 'quizarena';
 const VERSION = 2;
 let dbPromise = null;
 
+function showNotice(text) {
+  let el = document.getElementById('db-notice');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'db-notice';
+    el.style.cssText = 'position:fixed;left:50%;top:20px;transform:translateX(-50%);z-index:100;max-width:90vw;padding:14px 18px;border-radius:12px;background:#ffd23f;color:#241a00;font:600 16px system-ui;box-shadow:0 8px 30px rgba(0,0,0,.4);text-align:center';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+}
+
 function open() {
   if (!dbPromise) {
     dbPromise = new Promise((resolve, reject) => {
@@ -13,8 +24,19 @@ function open() {
         if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
         if (!db.objectStoreNames.contains('media')) db.createObjectStore('media'); // Video-/Audiodateien als Blob
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const db = req.result;
+        // Öffnet ein neuerer Tab eine neue Version, gibt dieser Tab die Datenbank frei.
+        db.onversionchange = () => {
+          db.close();
+          dbPromise = null;
+          showNotice('Quizarena wurde in einem anderen Tab aktualisiert. Bitte diese Seite neu laden.');
+        };
+        resolve(db);
+      };
       req.onerror = () => reject(req.error);
+      // Ein anderer Tab mit einer älteren Version blockiert das Update.
+      req.onblocked = () => showNotice('Bitte alle anderen Quizarena-Tabs schließen und diese Seite neu laden (Update auf neue Version).');
     });
   }
   return dbPromise;
