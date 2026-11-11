@@ -1,6 +1,7 @@
 // Handy-Ansicht: beitreten, antworten, buzzern, Joker setzen.
 import { createClient } from './net.js';
 import { $, esc, OPTION_COLORS, OPTION_LETTERS } from './ui.js';
+import { renderGm } from './gm.js';
 
 const app = $('#app');
 const params = new URLSearchParams(location.search);
@@ -24,19 +25,110 @@ let raf = null;
 let lastQ = null;
 let lastKey = null;
 let order = { qid: null, seq: [] }; // Reihenfolge-Frage: getippte Reihenfolge
+let choice = { qid: null, v: null };  // MC/WF: angetippt, aber noch nicht bestätigt
 let armedDouble = false;
+let isGm = false;
 
 function pidKey() { return 'qa-pid-' + code; }
+const roleKey = () => 'qa-role-' + code;
+const gmPidKey = () => 'qa-gmpid-' + code;
+const gmPwKey = () => 'qa-gmpw-' + code;
 
 function start() {
   if (!code) return renderCodeForm();
+  const role = store.getItem(roleKey());
+  if (role === 'gm') {
+    const pw = store.getItem(gmPwKey());
+    return pw ? connectGm(pw) : renderGmLogin();
+  }
   const pid = store.getItem(pidKey());
   const name = store.getItem('qa-name');
-  if (!pid || !name) return renderJoin();
-  connect(pid);
+  if (pid && name) return connect(pid);
+  renderRoleChoice();
+}
+
+// Bildschirm während des Spiels anlassen (wo der Browser das unterstützt)
+let wakeLock = null;
+async function keepAwake() {
+  try {
+    if ('wakeLock' in navigator && document.visibilityState === 'visible' && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    }
+  } catch (e) { /* nicht unterstützt oder abgelehnt */ }
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && client) keepAwake(); });
+
+function renderRoleChoice() {
+  app.innerHTML = page(`<b>Quizarena</b><span>Code ${esc(code)}</span>`, `
+    <div class="big-icon">🎮</div><h1>Willkommen!</h1>
+    <button class="btn primary big" id="as-player">Mitspielen</button>
+    <button class="btn big ghost" id="as-gm">🎙 Spielleiter</button>`);
+  $('#as-player').onclick = () => { store.setItem(roleKey(), 'player'); renderJoin(); };
+  $('#as-gm').onclick = () => renderGmLogin();
+}
+
+function renderGmLogin(error = '') {
+  app.innerHTML = page(`<b>Quizarena</b><span>Code ${esc(code)}</span>`, `
+    <div class="big-icon">🎙</div><h1>Spielleiter</h1>
+    <p class="muted" style="margin:0">Hier siehst du die Lösungen. Bitte Passwort eingeben.</p>
+    ${error ? `<div class="conn-banner">${esc(error)}</div>` : ''}
+    <input type="password" id="pw" class="p-input" placeholder="Passwort" inputmode="numeric" autocomplete="off">
+    <button class="btn primary big" id="go">Anmelden</button>
+    <button class="btn ghost" id="back">Zurück</button>`);
+  const go = () => {
+    const pw = $('#pw').value.trim();
+    if (!pw) return;
+    store.setItem(roleKey(), 'gm');
+    store.setItem(gmPwKey(), pw);
+    app.innerHTML = page('', '<div class="big-icon">⏳</div><h1>Verbinde …</h1>');
+    connectGm(pw);
+  };
+  $('#go').onclick = go;
+  $('#pw').onkeydown = e => { if (e.key === 'Enter') go(); };
+  $('#back').onclick = () => { store.removeItem(roleKey()); renderRoleChoice(); };
+  $('#pw').focus();
+}
+
+function gmLogout() {
+  if (client && client.stop) client.stop();
+  client = null; view = null; isGm = false;
+  store.removeItem(roleKey()); store.removeItem(gmPwKey());
+  renderRoleChoice();
+}
+
+function connectGm(pw) {
+  isGm = true;
+  let pid = store.getItem(gmPidKey());
+  if (!pid) { pid = 'g' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); store.setItem(gmPidKey(), pid); }
+  keepAwake();
+  app.addEventListener('gm-logout', gmLogout);
+  client = createClient(code, pid, {
+    helloData: () => ({ role: 'gm', pw }),
+    onStatus: st => { status = st; if (!view) renderStatus(); else { const c = $('#gm-conn'); if (c) c.innerHTML = connBanner(); } },
+    onMessage: msg => {
+      if (msg.t === 'gm') {
+        view = msg.v;
+        renderGm(app, msg.v, m => client && client.send(m));
+        app.insertAdjacentHTML('beforeend', `<div id="gm-conn">${connBanner()}</div>`);
+      }
+      if (msg.t === 'gmDenied') {
+        if (client) client.stop();
+        client = null; view = null;
+        store.removeItem(gmPwKey());
+        renderGmLogin('Falsches Passwort.');
+      }
+    },
+  });
+}
+
+function connBanner() {
+  const msg = { connecting: 'Verbinde mit dem Spiel …', offline: 'Verbindung unterbrochen – verbinde neu …', 'no-host': 'Spiel nicht gefunden. Läuft der Spielleiter-Bildschirm?' }[status];
+  return msg && status !== 'online' ? `<div class="conn-banner">${msg}</div>` : '';
 }
 
 function connect(pid) {
+  keepAwake();
   renderStatus();
   client = createClient(code, pid, {
     helloData: () => ({ name: store.getItem('qa-name') || '' }),
@@ -84,6 +176,7 @@ function renderJoin() {
     const name = $('#name').value.trim();
     if (!name) return;
     store.setItem('qa-name', name);
+    store.setItem(roleKey(), 'player');
     const pid = 'p' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
     store.setItem(pidKey(), pid);
     app.innerHTML = page('', '<div class="big-icon">⏳</div><h1>Verbinde …</h1>');
@@ -113,7 +206,7 @@ function renderStatus() {
 function viewKey(v) {
   if (v.phase === 'q' && v.q) {
     const q = v.q;
-    return ['q', q.id, q.answered, q.locked, q.waiting, q.buzz ? q.buzz.name : '', q.usedFifty, q.usedTime,
+    return ['q', q.id, q.answered, q.locked, q.waiting, q.paused, q.options ? q.options.length : '', q.buzz ? q.buzz.name : '', q.usedFifty, q.usedTime,
       q.jokers ? `${q.jokers.fifty}/${q.jokers.time}` : '-', sentFor, buzzedFor].join('|');
   }
   if (v.phase === 'intro') return ['intro', v.title, v.double ? `${v.double.left}/${v.double.used}` : '', armedDouble].join('|');
@@ -217,11 +310,16 @@ function renderQuestion(q) {
   if (q.locked) return `<div class="big-icon">⌛</div><h1>Zeit abgelaufen</h1>`;
 
   let input;
+  // Auswahl verwerfen, falls 50:50 sie gerade entfernt hat
+  if (q.type === 'mc' && choice.qid === q.id && !q.options.some(o => o.i === choice.v)) choice = { qid: null, v: null };
+  const picked = choice.qid === q.id ? choice.v : null;
+  const sel = v => (picked !== null && String(picked) === String(v) ? 'sel' : picked !== null ? 'unsel' : '');
+  const confirmBtn = `<button class="btn primary big p-confirm" id="confirm" ${picked === null ? 'disabled' : ''}>${picked === null ? 'Antwort antippen …' : 'Antwort bestätigen ✓'}</button>`;
   if (q.type === 'mc') {
-    input = `<div class="p-answers">${q.options.map(o => `<button class="p-ans" data-v="${o.i}" style="background:${OPTION_COLORS[o.i]}"><span class="l">${OPTION_LETTERS[o.i]}</span><span class="t">${esc(o.t)}</span></button>`).join('')}</div>`;
+    input = `<div class="p-answers">${q.options.map(o => `<button class="p-ans ${sel(o.i)}" data-v="${o.i}" style="background:${OPTION_COLORS[o.i]}"><span class="l">${OPTION_LETTERS[o.i]}</span><span class="t">${esc(o.t)}</span></button>`).join('')}</div>${confirmBtn}`;
   } else if (q.type === 'tf') {
-    input = `<div class="p-answers two"><button class="p-ans" data-v="true" style="background:#22a06b"><span class="l">✓</span><span class="t">Wahr</span></button>
-      <button class="p-ans" data-v="false" style="background:#e63e5c"><span class="l">✗</span><span class="t">Falsch</span></button></div>`;
+    input = `<div class="p-answers two"><button class="p-ans ${sel(true)}" data-v="true" style="background:#1f8a5b"><span class="l">✓</span><span class="t">Wahr</span></button>
+      <button class="p-ans ${sel(false)}" data-v="false" style="background:#b8323f"><span class="l">✗</span><span class="t">Falsch</span></button></div>${confirmBtn}`;
   } else if (q.type === 'order') {
     const seq = order.qid === q.id ? order.seq : [];
     input = `<div class="muted" style="font-size:.9em">Tippe die Einträge in der richtigen Reihenfolge an.</div>
@@ -274,10 +372,15 @@ function send(value) {
 }
 
 function bind() {
+  // Antippen wählt nur aus, gesendet wird erst mit „Bestätigen“
   document.querySelectorAll('.p-ans').forEach(b => b.onclick = () => {
     const raw = b.dataset.v;
-    send(raw === 'true' ? true : raw === 'false' ? false : Number(raw));
+    choice = { qid: view.q.id, v: raw === 'true' ? true : raw === 'false' ? false : Number(raw) };
+    if (navigator.vibrate) navigator.vibrate(15);
+    render();
   });
+  const conf = $('#confirm');
+  if (conf) conf.onclick = () => { if (choice.qid === view.q.id && choice.v !== null) send(choice.v); };
   const est = $('#est');
   if (est) {
     const go = () => {
@@ -323,6 +426,7 @@ function animateTimer(q) {
   cancelAnimationFrame(raf);
   const bar = $('#ptimer');
   if (!bar) return;
+  if (q.paused) { bar.style.transform = `scaleX(${q.dur ? Math.min(1, q.remaining / q.dur) : 0})`; bar.classList.add('paused'); return; }
   (function frame() {
     const rest = Math.max(0, qDeadline - Date.now());
     bar.style.transform = `scaleX(${q.dur ? Math.min(1, rest / q.dur) : 0})`;

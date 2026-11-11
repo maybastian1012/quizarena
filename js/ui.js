@@ -8,7 +8,7 @@ export function esc(s) {
 }
 
 export const PLAYER_COLORS = ['#ff5d73', '#4cc9f0', '#ffd23f', '#7bd389', '#c77dff', '#ff9f43', '#2ec4b6', '#f72585', '#a0c4ff', '#e9c46a', '#90be6d', '#ff7aa2'];
-export const OPTION_COLORS = ['#e63e5c', '#2f80ed', '#e0a100', '#22a06b'];
+export const OPTION_COLORS = ['#b8323f', '#2463a8', '#c98a12', '#1f8a5b'];
 export const OPTION_LETTERS = ['A', 'B', 'C', 'D'];
 
 export function toast(msg, ms = 2600) {
@@ -28,11 +28,12 @@ export function confetti(duration = 2500) {
   const ctx = c.getContext('2d');
   const resize = () => { c.width = innerWidth; c.height = innerHeight; };
   resize();
-  const parts = Array.from({ length: 160 }, () => ({
+  const GOLD = ['#f6c453', '#eaa62a', '#d9822b', '#fff1c7', '#b8862b'];
+  const parts = Array.from({ length: 160 }, (_, i) => ({
     x: Math.random() * c.width, y: -20 - Math.random() * c.height * 0.5,
     vx: (Math.random() - 0.5) * 4, vy: 2 + Math.random() * 4,
     r: 4 + Math.random() * 6, a: Math.random() * Math.PI, va: (Math.random() - 0.5) * 0.3,
-    col: PLAYER_COLORS[Math.floor(Math.random() * PLAYER_COLORS.length)],
+    col: i % 3 ? GOLD[i % GOLD.length] : PLAYER_COLORS[Math.floor(Math.random() * PLAYER_COLORS.length)],
   }));
   const end = performance.now() + duration;
   (function frame(t) {

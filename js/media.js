@@ -7,7 +7,7 @@ const urlCache = new Map();
 export async function saveMediaFile(file) {
   const id = 'm' + uid();
   await putMedia(id, file);
-  return { kind: 'file', id, mime: file.type || '', name: file.name, size: file.size };
+  return { kind: 'file', id, mime: file.type || '', name: file.name, size: file.size, start: 0, end: 0 };
 }
 
 export async function mediaUrl(id) {

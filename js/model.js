@@ -24,7 +24,8 @@ export const WIN_MODES = {
 
 export function newQuestion(type = 'mc') {
   // media: null | {kind:'file', id, mime, name, size} | {kind:'youtube', url, vid, start, end}
-  const q = { id: uid(), type, text: '', image: null, media: null, mediaFirst: false, time: 20 };
+  // notes: Moderationsnotiz, nur auf dem Spielleiter-Handy sichtbar
+  const q = { id: uid(), type, text: '', image: null, media: null, mediaFirst: false, time: 20, notes: '' };
   if (type === 'mc') { q.options = ['', '', '', '']; q.correct = 0; }
   if (type === 'tf') { q.correct = true; }
   if (type === 'estimate') { q.correct = 0; q.unit = ''; q.time = 30; }

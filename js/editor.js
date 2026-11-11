@@ -206,6 +206,8 @@ function questionCard(q, p, label, pos) {
       : `<label class="btn small" style="display:inline-flex;color:var(--text);font-size:.88em">🖼 Bild hinzufügen<input type="file" accept="image/*" data-img="${p}" hidden></label>`}
       ${mediaEditor(q, p)}</div>
     ${answer}
+    <details class="notes" ${q.notes ? 'open' : ''}><summary>🎙 Moderationsnotiz (nur Spielleiter-Handy)</summary>
+      <textarea data-bind="${p}.notes" placeholder="z. B. Hintergrundinfo, Anekdote, Aussprache …">${esc(q.notes || '')}</textarea></details>
   </div>`;
 }
 
@@ -222,7 +224,13 @@ function mediaEditor(q, p) {
     const isAudio = (m.mime || '').startsWith('audio');
     return `<div class="media-box"><b>${isAudio ? '🔊' : '🎬'} ${esc(m.name || 'Mediendatei')}</b> <span class="muted">(${(m.size / 1048576).toFixed(1)} MB)</span>
       <button class="btn small danger" data-act="mediaDel" data-path="${p}">Entfernen</button>
-      <div><${isAudio ? 'audio' : 'video'} class="media-preview" data-prev="${m.id}" controls preload="metadata"></${isAudio ? 'audio' : 'video'}></div>${first}</div>`;
+      <div><${isAudio ? 'audio' : 'video'} class="media-preview" data-prev="${m.id}" controls preload="metadata"></${isAudio ? 'audio' : 'video'}></div>
+      <div class="row" style="margin-top:6px">
+        <div style="width:150px"><label>Start (Sek.)</label><input type="number" min="0" step="0.5" data-bind="${p}.media.start" data-num value="${m.start || 0}"></div>
+        <div style="width:190px"><label>Ende (Sek., 0 = bis Schluss)</label><input type="number" min="0" step="0.5" data-bind="${p}.media.end" data-num value="${m.end || 0}"></div>
+        <button class="btn small" data-act="mediaMark" data-path="${p}" data-which="start" title="Aktuelle Position der Vorschau als Start übernehmen">⏮ Start = Vorschau</button>
+        <button class="btn small" data-act="mediaMark" data-path="${p}" data-which="end" title="Aktuelle Position der Vorschau als Ende übernehmen">⏭ Ende = Vorschau</button>
+      </div>${first}</div>`;
   }
   return `<div class="media-box"><b>▶ YouTube</b> <button class="btn small danger" data-act="mediaDel" data-path="${p}">Entfernen</button>
     <div class="row" style="margin-top:6px"><div class="grow"><label>Link</label><input type="text" data-bind="${p}.media.url" value="${esc(m.url || '')}" placeholder="https://www.youtube.com/watch?v=…"></div>
@@ -364,6 +372,14 @@ function onClick(e) {
     case 'mediaDel':
       set(path + '.media', null);
       break;
+    case 'mediaMark': {
+      // Position aus der Vorschau übernehmen
+      const m = get(path + '.media');
+      const prev = b.closest('.media-box').querySelector('.media-preview');
+      if (!m || !prev) return;
+      m[b.dataset.which] = Math.round(prev.currentTime * 2) / 2;
+      break;
+    }
     case 'addItem':
       get(path).items.push('');
       break;

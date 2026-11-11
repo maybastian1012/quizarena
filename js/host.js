@@ -22,6 +22,11 @@ let manualEndPlayed = false;
 
 const EXTRA_MS = 10000;  // Zusatzzeit-Joker
 const GRACE_MS = 400;    // Toleranz für Antworten kurz vor Schluss
+const GM_PASSWORD = '12345'; // Schutz vor versehentlichem Spielleiter-Login (kein echter Zugriffsschutz)
+const UNDO_MAX = 25;
+let undoStack = [];      // Schnappschüsse für „Rückgängig“ (nur im Speicher)
+let barTimer = null;
+let barPinned = false;
 
 // ---------------------------------------------------------------- Start / Ende
 
@@ -50,11 +55,13 @@ export async function startHost(root, makeCode) {
   if (!S.code) { S.code = makeCode(); save(); }
   S.jokerCfg = S.jokerCfg || { double: 0, fifty: 0, time: 0 };
   S.jl = S.jl || {};
+  S.gms = {}; // Spielleiter-Handys melden sich nach dem Neuladen mit Passwort neu an
+  undoStack = [];
   document.body.classList.add('stage-mode');
   root.innerHTML = '<div class="stage" id="stage"></div><div class="controls" id="controls"></div>';
 
   net = createHost(S.code, { onMessage, onLeave, onStatus });
-  intervals.push(setInterval(() => S.order.forEach(pid => net.send(pid, { t: 'ping' })), 4000));
+  intervals.push(setInterval(() => [...S.order, ...Object.keys(S.gms || {})].forEach(pid => net.send(pid, { t: 'ping' })), 4000));
   intervals.push(setInterval(onTick, 200));
 
   keyHandler = e => {
@@ -66,11 +73,14 @@ export async function startHost(root, makeCode) {
       if (b && !b.disabled) { e.preventDefault(); b.click(); }
     } else if (k === 'f') toggleFullscreen();
     else if (k === 'm') command('mute');
+    else if (k === 'h') { barPinned = !barPinned; showBar(); }
+    else if (k === 'z' && (e.ctrlKey || e.metaKey)) command('undo');
     else if (k === 'r' && buzzPending()) command('buzzRight');
     else if (k === 'x' && buzzPending()) command('buzzWrong');
   };
   document.addEventListener('keydown', keyHandler);
   document.addEventListener('click', unlockAudio, { once: true });
+  document.addEventListener('mousemove', showBar);
   render();
 }
 
@@ -78,9 +88,39 @@ export function stopHost() {
   intervals.forEach(clearInterval);
   intervals = [];
   if (keyHandler) document.removeEventListener('keydown', keyHandler);
+  document.removeEventListener('mousemove', showBar);
   if (net) net.destroy();
   net = null;
-  document.body.classList.remove('stage-mode');
+  document.body.classList.remove('stage-mode', 'gm-on', 'show-bar');
+}
+
+// Steuerleiste am Laptop: ausgeblendet, solange ein Spielleiter-Handy steuert; Maus oder H holt sie zurück.
+const gmConnected = () => Object.keys(S.gms || {}).some(connected);
+function showBar() {
+  document.body.classList.add('show-bar');
+  clearTimeout(barTimer);
+  if (!barPinned) barTimer = setTimeout(() => document.body.classList.remove('show-bar'), 3000);
+}
+
+// ---------------------------------------------------------------- Rückgängig
+
+function pushUndo(label) {
+  undoStack.push({ label, at: Date.now(), state: JSON.stringify(S) });
+  if (undoStack.length > UNDO_MAX) undoStack.shift();
+}
+
+function undo() {
+  const snap = undoStack.pop();
+  if (!snap) { toast('Nichts zum Rückgängigmachen'); return; }
+  const gms = S.gms;
+  S = JSON.parse(snap.state);
+  S.gms = gms;
+  // Laufende Frage: verstrichene Zeit seit dem Schnappschuss nicht anrechnen
+  if (S.phase === 'q' && S.q && S.q.start && !S.q.pausedAt) S.q.start += Date.now() - snap.at;
+  lastStageKey = null;
+  manualSel = new Set();
+  toast('↶ Rückgängig gemacht');
+  update();
 }
 
 function save() {
@@ -111,9 +151,10 @@ function nextUnplayed() { return S.results.findIndex(r => !r); }
 function rankedByTotals() { return pids().slice().sort((a, b) => (S.totals[b] || 0) - (S.totals[a] || 0)); }
 
 // Zeitfenster einer Frage (mit Zusatzzeit-Joker)
+const nowQ = () => (S.q && S.q.pausedAt) || Date.now(); // bei Pause steht die Uhr
 const qEnd = () => S.q.start + S.q.dur;
 const endFor = pid => qEnd() + ((S.q.extra && S.q.extra[pid]) || 0);
-const openFor = pid => !!(S.q && S.q.start && !S.q.locked && Date.now() <= endFor(pid) + GRACE_MS);
+const openFor = pid => !!(S.q && S.q.start && !S.q.locked && nowQ() <= endFor(pid) + GRACE_MS);
 const buzzPending = () => S && S.phase === 'q' && S.q && S.q.question.type === 'buzzer' && S.q.buzz && !S.q.buzzResult;
 
 function banner(text, color = 'var(--accent)') {
@@ -137,6 +178,21 @@ function onStatus(st) { netStatus = st; renderControls(); }
 function onLeave() { renderSoft(); }
 
 function onMessage(pid, msg) {
+  if (msg.t === 'hello' && msg.role === 'gm') {
+    if (String(msg.pw || '') !== GM_PASSWORD) {
+      net.send(pid, { t: 'gmDenied' });
+      setTimeout(() => net.drop(pid), 300);
+      return;
+    }
+    S.gms[pid] = { id: pid, since: Date.now() };
+    toast('🎙 Spielleiter-Handy verbunden');
+    update();
+    return;
+  }
+  if (msg.t === 'cmd') {
+    if (S.gms[pid]) gmCommand(msg.c, msg.arg);
+    return;
+  }
   if (msg.t === 'hello') {
     if (S.kicked[pid]) { net.send(pid, { t: 'kicked' }); setTimeout(() => net.drop(pid), 300); return; }
     if (!S.players[pid]) {
@@ -164,6 +220,11 @@ function onMessage(pid, msg) {
 function broadcast() {
   if (!net) return;
   pids().forEach(pid => net.send(pid, { t: 'view', v: viewFor(pid) }));
+  const gmIds = Object.keys(S.gms || {});
+  if (gmIds.length) {
+    const gv = gmView();
+    gmIds.forEach(pid => net.send(pid, { t: 'gm', v: gv }));
+  }
 }
 
 // ---------------------------------------------------------------- Fragen
@@ -260,8 +321,45 @@ function handleJoker(pid, kind, qid) {
   update();
 }
 
+function pauseTimer() {
+  if (S.phase !== 'q' || !S.q || !S.q.start || S.q.locked || S.q.pausedAt) return;
+  S.q.pausedAt = Date.now();
+  $$('#stage video, #stage audio').forEach(m => { try { m.pause(); } catch (e) { /* egal */ } });
+  update();
+}
+
+function resumeTimer() {
+  if (!S.q || !S.q.pausedAt) return;
+  S.q.start += Date.now() - S.q.pausedAt;
+  S.q.pausedAt = null;
+  update();
+}
+
+function addTime(ms = 10000) {
+  if (S.phase !== 'q' || !S.q || !S.q.start || S.q.locked) return;
+  S.q.dur += ms;
+  lastTick = null;
+  banner('⏱ +10 Sekunden für alle');
+  update();
+}
+
+// Frage ohne Wertung überspringen
+function skipQuestion() {
+  if (!S.q || (S.phase !== 'q' && S.phase !== 'reveal')) return;
+  stopMedia();
+  const src = S.q.src;
+  if (S.phase === 'reveal') return afterReveal();
+  if (src === 'game') return nextGameQuestion();
+  if (src === 'final') return nextFinalQuestion();
+  if (src === 'tie') { S.phase = 'tie'; S.q = null; update(); }
+}
+
 function onTick() {
   if (!S) return;
+  if (S.phase === 'q' && S.q && S.q.start && !S.q.locked && S.q.pausedAt) {
+    const num = $('#tnum'); if (num) num.textContent = '⏸';
+    return;
+  }
   if (S.phase === 'q' && S.q && S.q.start && !S.q.locked) {
     const now = Date.now();
     const main = qEnd() - now;
@@ -378,6 +476,7 @@ function awardGame(winners) {
   const pts = {};
   winners.forEach(pid => { pts[pid] = base * (dbl[pid] ? 2 : 1); S.totals[pid] = (S.totals[pid] || 0) + pts[pid]; });
   S.results[S.game.idx] = { winners, points: base, pts, doubled: Object.keys(dbl) };
+  S.lastWinners = winners;
   S.tie = null;
   S.phase = 'gameEnd';
   fx = 'confetti';
@@ -604,7 +703,8 @@ function viewFor(pid) {
           options: qu.type === 'mc' ? qu.options.map((t, i) => ({ i, t })).filter(o => String(o.t).trim() && !removed.includes(o.i)) : null,
           items: qu.type === 'order' ? q.shuffle.map(i => ({ i, t: qu.items[i] })) : null,
           waiting: !q.start,
-          remaining: q.start ? Math.max(0, endFor(pid) - now) : 0,
+          paused: !!q.pausedAt,
+          remaining: q.start ? Math.max(0, endFor(pid) - nowQ()) : 0,
           dur: q.dur + (q.extra[pid] || 0),
           answered: !!q.answers[pid],
           locked: !!q.start && !open,
@@ -707,9 +807,17 @@ function render() {
 function attachMedia(stage) {
   hydrateMedia(stage).then(() => {
     $$('video, audio', stage).forEach(m => {
+      const start = Number(m.dataset.start) || 0;
+      const end = Number(m.dataset.end) || 0;
+      const play = () => {
+        if (start && m.currentTime < start - 0.3) m.currentTime = start;
+        const p = m.play();
+        if (p && p.catch) p.catch(() => toast('Zum Abspielen auf ▶ klicken (Browser blockiert Autoplay).', 3500));
+      };
       m.onended = () => releaseAnswers();
-      const p = m.play();
-      if (p && p.catch) p.catch(() => toast('Zum Abspielen auf ▶ klicken (Browser blockiert Autoplay).', 3500));
+      // Nur den eingestellten Ausschnitt spielen
+      m.ontimeupdate = () => { if (end && m.currentTime >= end) { m.pause(); m.currentTime = end; releaseAnswers(); } };
+      if (m.readyState >= 1) play(); else m.addEventListener('loadedmetadata', play, { once: true });
     });
   });
 }
@@ -751,6 +859,7 @@ function renderLobby() {
       <div class="big">${S.mode === 'team' ? 'Teams' : 'Spieler'} <span class="muted" id="lobby-count">(${pids().length})</span></div>
       <p class="mid muted">Scannt den QR-Code mit dem Handy und gebt ${S.mode === 'team' ? 'euren Teamnamen' : 'euren Namen'} ein.</p>
       <div class="chips" id="lobby-chips">${lobbyChips()}</div>
+      <p class="muted" style="margin-top:4vh">🎙 Spielleiter: denselben QR-Code scannen und „Spielleiter“ wählen.</p>
     </div>
   </div>`;
 }
@@ -773,7 +882,7 @@ function scoresPanel(title = 'Gesamtstand') {
   const ranked = rankedByTotals();
   const max = ranked.length ? S.totals[ranked[0]] || 0 : 0;
   return `<div class="scores ${editScores ? 'editing' : ''}"><h3>${title}</h3>
-    ${ranked.map((pid, i) => `<div class="srow ${max > 0 && (S.totals[pid] || 0) === max ? 'lead' : ''}">
+    ${ranked.map((pid, i) => `<div class="srow ${max > 0 && (S.totals[pid] || 0) === max ? 'lead' : ''} ${(S.lastWinners || []).includes(pid) ? 'bump' : ''}">
       <span class="rk">${i + 1}.</span>
       <span class="nm"><span class="sw dot" style="background:${P(pid).color}"></span>${esc(nameOf(pid))}${jokerIcons(pid)}</span>
       <span class="row" style="gap:6px;align-items:center"><span class="adj"><button data-adj="${pid}" data-d="-1">−</button><button data-adj="${pid}" data-d="1">+</button></span><span class="val">${S.totals[pid] || 0}</span></span>
@@ -809,7 +918,8 @@ function doubledRow() {
 function renderIntro() {
   const g = curGame();
   return `${top(`<b>${esc(S.quiz.title)}</b>`, `Spiel ${S.game.idx + 1} / ${S.quiz.games.length}`)}
-  <div class="center">
+  <div class="center ringed">
+    <div class="ring"></div>
     <div class="intro-num">Spiel ${S.game.idx + 1}</div>
     <div class="huge intro-title">${esc(g.title)}</div>
     ${g.description ? `<div class="mid intro-desc">${esc(g.description)}</div>` : ''}
@@ -834,10 +944,11 @@ function countLabel() {
 function mediaBlock(qu) {
   const m = qu.media;
   if (m && m.kind === 'file') {
+    const clip = `data-start="${Number(m.start) || 0}" data-end="${Number(m.end) || 0}"`;
     if ((m.mime || '').startsWith('audio')) {
-      return `<div class="qmedia audio"><div class="speaker">🔊</div><audio data-media="${m.id}" controls></audio></div>`;
+      return `<div class="qmedia audio"><div class="speaker">🔊</div><audio data-media="${m.id}" ${clip} controls></audio></div>`;
     }
-    return `<div class="qmedia"><video data-media="${m.id}" controls playsinline></video></div>`;
+    return `<div class="qmedia"><video data-media="${m.id}" ${clip} controls playsinline></video></div>`;
   }
   if (m && m.kind === 'youtube' && m.vid) {
     const params = `autoplay=1&enablejsapi=1&rel=0&modestbranding=1&start=${Number(m.start) || 0}${Number(m.end) ? `&end=${Number(m.end)}` : ''}`;
@@ -1003,7 +1114,8 @@ function renderGameEnd() {
   const got = r.pts ? r.pts[r.winners[0]] : r.points;
   const doubled = r.doubled && r.doubled.includes(r.winners[0]);
   return `${top(`<b>${esc(g.title)}</b> · Spiel ${S.game.idx + 1}`, 'Ergebnis')}
-  <div class="center">
+  <div class="center ringed">
+    <div class="ring"></div>
     <div class="crown">🏆</div>
     <div class="huge winner-name" style="color:${p.color}">${esc(listNames(r.winners))}</div>
     <div class="big">gewinnt „${esc(g.title)}“ · +${pointsLabel(got)}</div>
@@ -1020,7 +1132,8 @@ function renderFinalIntro() {
     elimination: `Jede falsche Antwort kostet ein Leben. Wer zuletzt noch Leben hat, gewinnt.`,
   }[f.winMode];
   return `${top(`<b>${esc(S.quiz.title)}</b>`, 'Finale')}
-  <div class="center">
+  <div class="center ringed">
+    <div class="ring"></div>
     <div class="intro-num">Das große Finale</div>
     <div class="huge intro-title">🔥 ${esc(f.title || 'Finale')}</div>
     <div class="mid intro-desc">${f.description ? esc(f.description) + '<br>' : ''}${rule}${f.headStart && !f.description ? ' Die Vorrundenpunkte sind euer Vorsprung.' : ''}${F.targetRaised ? '<br><span style="color:var(--accent)">Ziel wurde angehoben, weil jemand schon zu viele Punkte hatte.</span>' : ''}</div>
@@ -1035,7 +1148,8 @@ function renderEnd() {
   const heights = { 0: '34vh', 1: '24vh', 2: '16vh' };
   const champ = S.champion ? P(S.champion) : null;
   return `${top(`<b>${esc(S.quiz.title)}</b>`, 'Siegerehrung')}
-  <div class="center">
+  <div class="center ringed">
+    <div class="ring"></div>
     <div class="crown">👑</div>
     <div class="huge winner-name" style="color:${champ ? champ.color : 'inherit'}">${champ ? esc(champ.name) : 'Kein Sieger'}</div>
     <div class="big">${champ ? 'gewinnt den Abend!' : ''}</div>
@@ -1057,41 +1171,172 @@ function bindStage() {
   });
   $$('[data-game]').forEach(t => t.onclick = () => startGame(Number(t.dataset.game)));
   $$('[data-final]').forEach(t => t.onclick = () => { if (S.finished) { S.phase = 'end'; update(); } else toFinish(); });
-  $$('[data-adj]').forEach(b => b.onclick = () => {
-    const pid = b.dataset.adj;
-    S.totals[pid] = Math.max(0, (S.totals[pid] || 0) + Number(b.dataset.d));
-    update();
-  });
-  $$('[data-pick]').forEach(b => b.onclick = () => {
-    const pid = b.dataset.pick;
-    manualSel.has(pid) ? manualSel.delete(pid) : manualSel.add(pid);
-    render();
-  });
+  $$('[data-adj]').forEach(b => b.onclick = () => gmCommand('adjTotal', { pid: b.dataset.adj, d: Number(b.dataset.d) }));
+  $$('[data-pick]').forEach(b => b.onclick = () => gmCommand('manualToggle', b.dataset.pick));
   $$('[data-tiewin]').forEach(b => b.onclick = () => {
-    if (confirm(`${nameOf(b.dataset.tiewin)} als Sieger festlegen?`)) finishTie(b.dataset.tiewin);
+    if (confirm(`${nameOf(b.dataset.tiewin)} als Sieger festlegen?`)) gmCommand('tieWin', b.dataset.tiewin);
   });
+}
+
+// ---------------------------------------------------------------- Spielleiter-Handy
+
+// Befehle mit Parameter (vom Handy oder vom Laptop)
+function gmCommand(c, arg) {
+  const pid = arg && typeof arg === 'object' ? arg.pid : arg;
+  const d = arg && typeof arg === 'object' ? Math.sign(Number(arg.d) || 0) : 0;
+  switch (c) {
+    case 'adjTotal':
+      if (!S.players[pid] || !d) return;
+      pushUndo(c);
+      S.totals[pid] = Math.max(0, (S.totals[pid] || 0) + d);
+      return update();
+    case 'adjCorrect':
+      if (!S.players[pid] || !d || !S.game) return;
+      pushUndo(c);
+      S.game.correct[pid] = (S.game.correct[pid] || 0) + d;
+      return update();
+    case 'adjFinal': {
+      if (!S.players[pid] || !d || !S.final) return;
+      pushUndo(c);
+      const key = S.quiz.final.winMode === 'elimination' ? 'lives' : 'scores';
+      S.final[key][pid] = Math.max(0, (S.final[key][pid] || 0) + d);
+      return update();
+    }
+    case 'startGame':
+      if (S.phase !== 'board' || S.finished) return;
+      pushUndo(c);
+      return startGame(Number(arg));
+    case 'manualToggle':
+      if (S.phase !== 'manual' || !S.players[pid]) return;
+      manualSel.has(pid) ? manualSel.delete(pid) : manualSel.add(pid);
+      return update();
+    case 'tieWin':
+      if (S.phase !== 'tie' || !S.tie || !S.tie.pids.includes(pid)) return;
+      pushUndo(c);
+      return finishTie(pid);
+    case 'kick':
+      if (!S.players[pid]) return;
+      S.kicked[pid] = true;
+      net.send(pid, { t: 'kicked' });
+      setTimeout(() => net.drop(pid), 300);
+      return update();
+    default:
+      // einfache Befehle wie am Laptop (ohne Vollbild/Beenden/Test-Spieler)
+      if (['quit', 'fullscreen', 'testplayer', 'editScores'].includes(c)) return;
+      return command(c);
+  }
+}
+
+function nextQuestionPreview() {
+  let qu = null, label = '';
+  if (S.game && curGame() && curGame().type === 'quiz') {
+    const g = curGame();
+    const i = S.phase === 'intro' ? 0 : S.game.qi + 1;
+    if (i < g.questions.length) { qu = g.questions[i]; label = `Frage ${i + 1} / ${g.questions.length}`; }
+  } else if (S.final && ['finalIntro', 'q', 'reveal'].includes(S.phase)) {
+    const i = S.phase === 'finalIntro' ? 0 : S.final.qi + 1;
+    if (i < finalLimit()) { qu = S.quiz.final.questions[i]; label = `Finale · Frage ${i + 1}`; }
+  }
+  return qu ? { label, text: qu.text, type: qu.type, solution: correctText(qu), notes: qu.notes || '' } : null;
+}
+
+function gmAnswers(q) {
+  const qu = q.question;
+  if (qu.type === 'mc' || qu.type === 'tf') {
+    const opts = qu.type === 'tf'
+      ? [{ i: true, t: 'Wahr', l: '✓' }, { i: false, t: 'Falsch', l: '✗' }]
+      : qu.options.map((t, i) => ({ i, t, l: OPTION_LETTERS[i] })).filter(o => String(o.t).trim());
+    return {
+      kind: 'options',
+      options: opts.map(o => ({
+        letter: o.l, text: o.t, correct: o.i === qu.correct,
+        color: qu.type === 'tf' ? (o.i ? '#1f8a5b' : '#b8323f') : OPTION_COLORS[o.i],
+        names: Object.entries(q.answers).filter(([, a]) => a.v === o.i).map(([pid]) => nameOf(pid)),
+      })),
+    };
+  }
+  if (qu.type === 'estimate') {
+    const list = Object.entries(q.answers).map(([pid, a]) => ({ name: nameOf(pid), value: formatNumber(a.v), d: Math.abs(a.v - Number(qu.correct)) }))
+      .sort((a, b) => a.d - b.d).map(x => ({ ...x, d: formatNumber(x.d) }));
+    return { kind: 'list', items: list.map(x => ({ name: x.name, text: `${x.value} ${qu.unit || ''}`, extra: `±${x.d}` })) };
+  }
+  if (qu.type === 'order') {
+    return { kind: 'list', items: Object.entries(q.answers).map(([pid, a]) => ({ name: nameOf(pid), text: answerText(qu, a.v), ok: isRight(qu, a.v) })) };
+  }
+  return { kind: 'buzz' };
+}
+
+function gmView() {
+  const g = curGame();
+  const q = S.q;
+  const ctrl = controlsModel();
+  const inFinal = !!S.final && !S.game;
+  const elim = S.quiz.final.winMode === 'elimination';
+  const v = {
+    phase: S.phase, code: S.code, quiz: S.quiz.title, mode: S.mode,
+    controls: { primary: ctrl.primary, buttons: ctrl.buttons.filter(b => !b.laptopOnly) },
+    undo: undoStack.length ? undoStack[undoStack.length - 1].label : null,
+    muted: isMuted(),
+    context: g ? `Spiel ${S.game.idx + 1}: ${g.title}` : (S.final ? (S.quiz.final.title || 'Finale') : ''),
+    players: rankedByTotals().map(pid => ({
+      id: pid, name: nameOf(pid), color: P(pid).color, online: connected(pid),
+      total: S.totals[pid] || 0,
+      correct: S.game ? (S.game.correct[pid] || 0) : null,
+      final: inFinal ? (elim ? S.final.lives[pid] || 0 : S.final.scores[pid] || 0) : null,
+      jokers: S.jl[pid] || {},
+      doubled: !!(S.game && S.game.doubled && S.game.doubled[pid]),
+    })),
+    finalLabel: inFinal ? (elim ? 'Leben' : 'Finalpunkte') : null,
+    next: nextQuestionPreview(),
+  };
+  if (S.phase === 'board') {
+    v.games = S.quiz.games.map((gg, i) => ({ idx: i, title: gg.title, type: gg.type, points: gg.points, done: !!S.results[i], winner: S.results[i] ? listNames(S.results[i].winners) : null }));
+  }
+  if (S.phase === 'intro' || S.phase === 'manual') {
+    v.game = { title: g.title, description: g.description, points: g.points, type: g.type, questions: g.questions.length };
+  }
+  if (S.phase === 'manual') v.manualSel = [...manualSel];
+  if (S.phase === 'tie') v.tie = { ids: S.tie.pids.slice(), label: S.tie.context === 'game' ? g.title : 'Finale/Gesamt', hasQuestion: !!pickTieQuestion() };
+  if ((S.phase === 'q' || S.phase === 'reveal') && q) {
+    const qu = q.question;
+    v.q = {
+      id: qu.id, src: q.src, type: qu.type, typeLabel: { mc: 'Multiple Choice', tf: 'Wahr/Falsch', estimate: 'Schätzfrage', order: 'Reihenfolge', buzzer: 'Buzzer' }[qu.type],
+      text: qu.text, solution: correctText(qu), notes: qu.notes || '',
+      hasMedia: !!qu.media, waiting: !q.start, locked: q.locked, paused: !!q.pausedAt,
+      remaining: q.start && !q.locked ? Math.max(0, qEnd() - nowQ()) : 0,
+      answered: Object.keys(q.answers).length, eligible: q.eligible.length,
+      missing: q.eligible.filter(pid => !q.answers[pid]).map(nameOf),
+      buzz: q.buzz ? { name: nameOf(q.buzz), result: q.buzzResult } : null,
+      answers: gmAnswers(q),
+      revealed: S.phase === 'reveal',
+      winners: q.result ? q.result.winners.map(nameOf) : null,
+      label: q.src === 'game' ? `Frage ${S.game.qi + 1} / ${g.questions.length}` : q.src === 'tie' ? 'Stechfrage' : `Finale · Frage ${S.final.qi + 1}`,
+    };
+  }
+  if (S.phase === 'gameEnd') {
+    const r = S.results[S.game.idx];
+    v.result = { winners: listNames(r.winners), pts: r.pts ? r.pts[r.winners[0]] : r.points };
+  }
+  if (S.phase === 'end') v.champion = S.champion ? nameOf(S.champion) : null;
+  return v;
 }
 
 // ---------------------------------------------------------------- Steuerleiste
 
-function renderControls() {
-  const el = $('#controls');
-  if (!el) return;
-  const n = pids().filter(connected).length;
-  const dot = { online: 'on', reconnecting: 'warn', 'waiting-id': 'warn', connecting: 'warn', error: 'off' }[netStatus] || 'warn';
-  const stLabel = { online: 'Online', reconnecting: 'Verbinde neu …', 'waiting-id': 'Raum wird wiederhergestellt …', connecting: 'Verbinde …', error: 'Verbindungsfehler' }[netStatus] || netStatus;
-  const btns = [];
+// Aktionen der aktuellen Phase – genutzt von der Laptop-Leiste und vom Spielleiter-Handy.
+function controlsModel() {
+  const buttons = [];
   let primary = null;
   const g = curGame();
-
+  const q = S.q;
   switch (S.phase) {
     case 'lobby':
-      btns.push(`<button class="btn small" data-c="testplayer">+ Test-${T().one} öffnen</button>`);
+      buttons.push({ c: 'testplayer', label: `+ Test-${T().one} öffnen`, laptopOnly: true });
       primary = { label: 'Spieltafel öffnen', c: 'toBoard', disabled: !pids().length };
       break;
     case 'board': {
-      btns.push(`<button class="btn small ghost" data-c="lobby">QR-Code zeigen</button>`);
-      btns.push(`<button class="btn small ghost" data-c="editScores">${editScores ? 'Korrektur fertig' : 'Punkte korrigieren'}</button>`);
+      buttons.push({ c: 'lobby', label: 'QR-Code zeigen', cls: 'ghost' });
+      buttons.push({ c: 'editScores', label: editScores ? 'Korrektur fertig' : 'Punkte korrigieren', cls: 'ghost', laptopOnly: true });
       const next = nextUnplayed();
       primary = S.finished ? { label: 'Zur Siegerehrung', c: 'toEnd' }
         : next >= 0 ? { label: `Spiel ${next + 1} starten`, c: 'nextGame' }
@@ -1099,30 +1344,35 @@ function renderControls() {
       break;
     }
     case 'intro':
-      btns.push(`<button class="btn small ghost" data-c="toBoard">Zurück zur Tafel</button>`);
+      buttons.push({ c: 'toBoard', label: 'Zurück zur Tafel', cls: 'ghost' });
       primary = { label: g.type === 'manual' ? 'Spiel beginnen' : 'Erste Frage', c: 'beginGame' };
       break;
     case 'q':
-      if (!S.q.start) { primary = { label: 'Antworten freigeben', c: 'release' }; break; }
+      if (!q.start) { primary = { label: 'Antworten freigeben', c: 'release' }; buttons.push({ c: 'skip', label: '⏭ Überspringen', cls: 'ghost' }); break; }
       if (buzzPending()) {
-        btns.push(`<button class="btn judge good" data-c="buzzRight">✓ Richtig <span class="kbd">R</span></button>`);
-        btns.push(`<button class="btn judge bad" data-c="buzzWrong">✗ Falsch <span class="kbd">X</span></button>`);
+        buttons.push({ c: 'buzzRight', label: '✓ Richtig', cls: 'judge good', key: 'R' });
+        buttons.push({ c: 'buzzWrong', label: '✗ Falsch', cls: 'judge bad', key: 'X' });
         break;
       }
-      if (!S.q.locked) btns.push(`<button class="btn small ghost" data-c="lock">${S.q.question.type === 'buzzer' ? 'Buzzer schließen' : 'Antworten schließen'}</button>`);
+      if (!q.locked) {
+        buttons.push(q.pausedAt ? { c: 'resume', label: '▶ Weiter', cls: '' } : { c: 'pause', label: '⏸ Pause', cls: 'ghost' });
+        buttons.push({ c: 'addTime', label: '+10 s', cls: 'ghost' });
+        buttons.push({ c: 'lock', label: q.question.type === 'buzzer' ? 'Buzzer schließen' : 'Antworten schließen', cls: 'ghost' });
+      }
+      buttons.push({ c: 'skip', label: '⏭ Überspringen', cls: 'ghost' });
       primary = { label: 'Auflösen', c: 'reveal' };
       break;
     case 'reveal': {
       let label = 'Weiter';
-      if (S.q.src === 'game') label = S.game.qi + 1 < g.questions.length ? 'Nächste Frage' : 'Spiel auswerten';
-      if (S.q.src === 'tie') label = 'Stechen auswerten';
+      if (q.src === 'game') label = S.game.qi + 1 < g.questions.length ? 'Nächste Frage' : 'Spiel auswerten';
+      if (q.src === 'tie') label = 'Stechen auswerten';
       primary = { label, c: 'afterReveal' };
       break;
     }
     case 'manual':
-      if (Number(g.timer)) btns.push(`<button class="btn small" data-c="mtimer">${S.manualTimer ? 'Timer neu starten' : 'Timer starten'}</button>`);
-      btns.push(`<button class="btn small ghost" data-c="toBoard">Abbrechen</button>`);
-      if (manualSel.size >= 2) btns.push(`<button class="btn small" data-c="manualTie">Stechfrage zwischen Auswahl</button>`);
+      if (Number(g.timer)) buttons.push({ c: 'mtimer', label: S.manualTimer ? 'Timer neu starten' : 'Timer starten', cls: '' });
+      buttons.push({ c: 'toBoard', label: 'Abbrechen', cls: 'ghost' });
+      if (manualSel.size >= 2) buttons.push({ c: 'manualTie', label: 'Stechfrage zwischen Auswahl', cls: '' });
       primary = { label: 'Sieger bestätigen', c: 'manualWin', disabled: manualSel.size !== 1 };
       break;
     case 'tie':
@@ -1132,18 +1382,32 @@ function renderControls() {
       primary = { label: 'Zur Spieltafel', c: 'toBoard' };
       break;
     case 'finalIntro':
-      btns.push(`<button class="btn small ghost" data-c="toBoard">Zurück zur Tafel</button>`);
+      buttons.push({ c: 'toBoard', label: 'Zurück zur Tafel', cls: 'ghost' });
       primary = { label: 'Finale starten', c: 'nextFinal' };
       break;
     case 'end':
-      btns.push(`<button class="btn small ghost" data-c="toBoardFromEnd">Spieltafel ansehen</button>`);
+      buttons.push({ c: 'toBoardFromEnd', label: 'Spieltafel ansehen', cls: 'ghost' });
       break;
   }
+  return { primary, buttons };
+}
+
+function renderControls() {
+  const el = $('#controls');
+  if (!el) return;
+  const n = pids().filter(connected).length;
+  const gmN = Object.keys(S.gms || {}).filter(connected).length;
+  document.body.classList.toggle('gm-on', gmN > 0);
+  const dot = { online: 'on', reconnecting: 'warn', 'waiting-id': 'warn', connecting: 'warn', error: 'off' }[netStatus] || 'warn';
+  const stLabel = { online: 'Online', reconnecting: 'Verbinde neu …', 'waiting-id': 'Raum wird wiederhergestellt …', connecting: 'Verbinde …', error: 'Verbindungsfehler' }[netStatus] || netStatus;
+  const { primary, buttons } = controlsModel();
+  const btns = buttons.map(b => `<button class="btn ${b.cls && b.cls.includes('judge') ? '' : 'small'} ${b.cls || ''}" data-c="${b.c}">${b.label}${b.key ? ` <span class="kbd">${b.key}</span>` : ''}</button>`);
 
   el.innerHTML = `
-    <span class="status"><span class="dot ${dot}"></span>${stLabel} · ${n} verbunden · Code <b>${S.code}</b></span>
+    <span class="status"><span class="dot ${dot}"></span>${stLabel} · ${n} verbunden${gmN ? ' · 🎙 Spielleiter' : ''} · Code <b>${S.code}</b></span>
     ${btns.join('')}
     <span class="spacer"></span>
+    <button class="btn small ghost" data-c="undo" title="Rückgängig (Strg+Z)" ${undoStack.length ? '' : 'disabled'}>↶</button>
     <button class="btn small ghost" data-c="mute" title="Ton an/aus (M)">${isMuted() ? '🔇' : '🔊'}</button>
     <button class="btn small ghost" data-c="fullscreen" title="Vollbild (F)">⛶</button>
     <button class="btn small danger" data-c="quit">Abend beenden</button>
@@ -1152,8 +1416,17 @@ function renderControls() {
   $$('[data-c]', el).forEach(b => b.onclick = () => command(b.dataset.c));
 }
 
+const UNDOABLE = new Set(['toBoard', 'toEnd', 'nextGame', 'finish', 'beginGame', 'release', 'lock', 'reveal', 'buzzRight', 'buzzWrong',
+  'afterReveal', 'manualWin', 'manualTie', 'startTie', 'nextFinal', 'skip', 'addTime', 'toBoardFromEnd', 'lobby']);
+
 function command(c) {
+  if (UNDOABLE.has(c)) pushUndo(c);
   switch (c) {
+    case 'undo': undo(); break;
+    case 'pause': pauseTimer(); break;
+    case 'resume': resumeTimer(); break;
+    case 'addTime': addTime(); break;
+    case 'skip': skipQuestion(); break;
     case 'testplayer': window.open('play.html?r=' + S.code + '&test=' + Date.now(), '_blank'); break;
     case 'toBoard': stopMedia(); S.phase = 'board'; S.q = null; update(); break;
     case 'toBoardFromEnd': S.phase = 'board'; update(); break;

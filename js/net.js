@@ -79,9 +79,10 @@ export function createClient(code, pid, handlers) {
   let timer = null;
   let guard = null;
   let connecting = false;
+  let stopped = false;
 
   function connect() {
-    if (connecting || (conn && conn.open)) return;
+    if (stopped || connecting || (conn && conn.open)) return;
     connecting = true;
     handlers.onStatus('connecting');
     // Sicherheitsnetz: Kommt nach 10 s keine Verbindung zustande, neu versuchen.
@@ -129,11 +130,12 @@ export function createClient(code, pid, handlers) {
 
   function schedule(ms) {
     clearTimeout(timer);
+    if (stopped) return;
     timer = setTimeout(connect, ms);
   }
 
   // Lebenszeichen: Host schickt regelmäßig Pings. Bleiben sie aus, neu verbinden.
-  setInterval(() => {
+  const heartbeat = setInterval(() => {
     if (conn && conn.open && Date.now() - lastMsg > 12000) {
       try { conn.close(); } catch (e) { /* egal */ }
       connecting = false;
@@ -141,7 +143,7 @@ export function createClient(code, pid, handlers) {
     }
   }, 3000);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && !(conn && conn.open)) { connecting = false; schedule(100); }
+    if (!stopped && document.visibilityState === 'visible' && !(conn && conn.open)) { connecting = false; schedule(100); }
   });
 
   connect();
@@ -149,5 +151,12 @@ export function createClient(code, pid, handlers) {
   return {
     send(msg) { if (conn && conn.open) { conn.send(msg); return true; } return false; },
     isOpen: () => !!(conn && conn.open),
+    // Verbindung endgültig beenden (z. B. falsches Spielleiter-Passwort)
+    stop() {
+      stopped = true;
+      clearTimeout(timer); clearTimeout(guard); clearInterval(heartbeat);
+      try { if (conn) conn.close(); } catch (e) { /* egal */ }
+      try { if (peer) peer.destroy(); } catch (e) { /* egal */ }
+    },
   };
 }
