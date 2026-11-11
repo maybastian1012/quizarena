@@ -13,7 +13,8 @@ Online: https://maybastian1012.github.io/quizarena/
 | `js/model.js` | Datenmodell, Beispielquizze, Prüfung vor dem Start |
 | `js/editor.js` | Editor für Spiele, Fragen, Medien, Finale, Stechfragen |
 | `js/host.js` | Spielablauf, Wertung, Joker, Buzzer (Spielleiter) |
-| `js/player.js` | Handy-Ansicht |
+| `js/player.js` | Handy-Ansicht (Rollenwahl, Spieler) |
+| `js/gm.js` | Spielleiter-Ansicht auf dem Handy |
 | `js/net.js` | Verbindung über WebRTC (PeerJS) |
 | `js/store.js` | Speicherung im Browser (IndexedDB) |
 | `js/media.js` | Video-/Audiodateien speichern, exportieren, aufräumen |
@@ -38,13 +39,24 @@ oder http://localhost:8765/test.html?code=CODE für alles in einem Fenster.
 - Quizze und Mediendateien liegen im Browser des Laptops. Vor Browserwechsel oder Löschen der Browserdaten: exportieren
   (die Exportdatei enthält auch hochgeladene Videos/Audios).
 
+## Spielleiter-Handy
+
+- Denselben QR-Code scannen → „Spielleiter“ → Passwort `12345`
+  (Schutz gegen versehentliches Einloggen, kein echter Zugriffsschutz)
+- Zeigt Lösung, Moderationsnotiz, Live-Antworten (wer hat was getippt), Vorschau auf die nächste Frage
+- Steuert alles: Weiter, Auflösen, Buzzer werten, Pause, +10 s, Überspringen, Rückgängig, Spiele starten,
+  Sieger wählen, Punkte/Richtige/Finalwerte korrigieren, Spieler entfernen
+- Solange ein Spielleiter-Handy verbunden ist, blendet der TV die Steuerleiste aus (Maus bewegen oder H holt sie zurück)
+- Laptop-Tasten: Strg+Z = Rückgängig
+
 ## Fragetypen
 
-- Multiple Choice, Wahr/Falsch, Schätzfrage
+- Multiple Choice, Wahr/Falsch (Antwort antippen, dann bestätigen), Schätzfrage
 - Reihenfolge: zählt nur, wenn die komplette Reihenfolge stimmt
 - Buzzer: wer zuerst drückt, antwortet laut; Spielleiter wertet. Falsch = −1 und die Frage ist vorbei
 - Jede Frage kann ein Bild, eine Video-/Audiodatei oder einen YouTube-Link haben
-  (optional „erst abspielen, dann Antworten freigeben“)
+  (Start/Ende einstellbar, optional „erst abspielen, dann Antworten freigeben“)
+- Jede Frage kann eine Moderationsnotiz haben (nur auf dem Spielleiter-Handy sichtbar)
 
 ## Joker (Anzahl pro Abend beim Einrichten)
 
