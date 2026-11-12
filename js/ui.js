@@ -80,6 +80,53 @@ export function downloadJSON(obj, filename) {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
+// Profilbild (Selfie) oder farbiger Kreis mit Initialen
+export function avatar(p, cls = '') {
+  if (!p) return '';
+  if (p.photo) return `<span class="av ${cls}" style="--c:${p.color || '#888'}"><img src="${p.photo}" alt=""></span>`;
+  const ini = String(p.name || '?').trim().split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase();
+  return `<span class="av ${cls}" style="--c:${p.color || '#888'}"><b>${esc(ini)}</b></span>`;
+}
+
+// Text so weit verkleinern, bis er in seinen Rahmen passt
+export function fitText(root = document) {
+  root.querySelectorAll('[data-fit]').forEach(el => {
+    el.style.fontSize = '';
+    const cs = getComputedStyle(el);
+    let size = parseFloat(cs.fontSize);
+    const min = Number(el.dataset.fit) || 14;
+    const maxH = cs.maxHeight === 'none' ? Infinity : parseFloat(cs.maxHeight);
+    // zu breit (einzelnes Wort passt nicht) oder höher als erlaubt (Unterlängen/Zeilenhöhe großzügig toleriert)
+    const tooBig = () => el.scrollWidth > el.clientWidth + 1 || el.scrollHeight > maxH + size * 0.25;
+    let guard = 40;
+    while (guard-- > 0 && size > min && tooBig()) {
+      size *= 0.92;
+      el.style.fontSize = size + 'px';
+    }
+  });
+}
+
+// Bild verkleinern und quadratisch zuschneiden (für Selfies)
+export function squareImage(file, size = 220) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Bild konnte nicht gelesen werden'));
+      img.onload = () => {
+        const s = Math.min(img.width, img.height);
+        const cv = document.createElement('canvas');
+        cv.width = cv.height = size;
+        cv.getContext('2d').drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, size, size);
+        resolve(cv.toDataURL('image/jpeg', 0.75));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 export function slug(s) {
   return String(s).toLowerCase().replace(/[äöüß]/g, c => ({ ä: 'ae', ö: 'oe', ü: 'ue', ß: 'ss' }[c])).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'quiz';
 }

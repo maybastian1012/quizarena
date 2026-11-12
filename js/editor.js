@@ -1,27 +1,34 @@
-// Editor: Quizze mit Spielen, Fragen, Finale und Stechfragen anlegen.
+// Editor: links Spiele-Liste, rechts das gewählte Spiel mit seinen Fragen.
 import { getQuiz, saveQuiz } from './store.js';
-import { newGame, newQuestion, normalizeQuiz, parseYouTube, QUESTION_TYPES, WIN_MODES, uid } from './model.js';
+import {
+  newGame, newQuestion, normalizeQuiz, normalizeQuestion, parseYouTube, questionWarnings, questionLabel,
+  QUESTION_TYPES, TYPE_ICONS, TYPE_HINTS, WIN_MODES, uid,
+} from './model.js';
 import { $, $$, esc, toast, readImage, downloadJSON, slug, OPTION_COLORS, OPTION_LETTERS } from './ui.js';
 import { saveMediaFile, bundleQuiz, mediaUrl } from './media.js';
+import { renderPreview } from './host.js';
+import { importExcelInto } from './excel.js';
 
-const ALL_TYPES = ['mc', 'tf', 'estimate', 'order', 'buzzer'];
+const ALL_TYPES = ['mc', 'tf', 'estimate', 'order', 'buzzer', 'hint', 'reveal', 'text', 'hilo'];
 const MAX_MEDIA_MB = 200;
 
 let quiz = null;
 let root = null;
 let saveTimer = null;
-const open = new Set(); // aufgeklappte Bereiche merken
+let sel = null;              // 'settings' | 'final' | 'ties' | 'g:<id>'
+const openQ = new Set();     // aufgeklappte Fragen
+let addMenu = null;          // Pfad, für den das „Frage hinzufügen“-Menü offen ist
 
 export async function startEditor(el, id) {
   root = el;
   const q = await getQuiz(id);
   if (!q) { location.hash = ''; return; }
   quiz = normalizeQuiz(q);
+  if (!sel || !validSel()) sel = quiz.games[0] ? 'g:' + quiz.games[0].id : 'settings';
   render();
   root.addEventListener('input', onInput);
   root.addEventListener('change', onChange);
   root.addEventListener('click', onClick);
-  root.addEventListener('toggle', onToggle, true);
 }
 
 export function stopEditor() {
@@ -30,8 +37,13 @@ export function stopEditor() {
   root.removeEventListener('input', onInput);
   root.removeEventListener('change', onChange);
   root.removeEventListener('click', onClick);
-  root.removeEventListener('toggle', onToggle, true);
+  closePreview();
   root = null;
+}
+
+function validSel() {
+  if (['settings', 'final', 'ties'].includes(sel)) return true;
+  return quiz.games.some(g => 'g:' + g.id === sel);
 }
 
 // ---------------------------------------------------------------- Speichern
@@ -52,191 +64,290 @@ function flush() {
 
 // ---------------------------------------------------------------- Pfad-Helfer
 
-function get(path) {
-  return path.split('.').reduce((o, k) => (o == null ? o : o[k]), quiz);
-}
+function get(path) { return path.split('.').reduce((o, k) => (o == null ? o : o[k]), quiz); }
 function set(path, value) {
   const keys = path.split('.');
   const last = keys.pop();
   const obj = keys.reduce((o, k) => o[k], quiz);
   obj[last] = value;
 }
+const gameIndex = () => quiz.games.findIndex(g => 'g:' + g.id === sel);
 
 // ---------------------------------------------------------------- Rendern
 
 function render() {
   const scrollY = window.scrollY;
-  const f = quiz.final;
-  root.innerHTML = `<div class="editor">
-    <div class="editor-head">
-      <a class="btn small" href="#">← Übersicht</a>
-      <input type="text" class="title" data-bind="title" value="${esc(quiz.title)}" placeholder="Name des Abends">
-      <span class="muted" id="save-state">Gespeichert ✓</span>
-      <button class="btn small" data-act="export">Exportieren</button>
+  root.innerHTML = `<div class="ed">
+    <header class="ed-head">
+      <a class="btn small ghost" href="#">← Übersicht</a>
+      <input type="text" class="ed-title" data-bind="title" value="${esc(quiz.title)}" placeholder="Name des Abends">
+      <span class="muted ed-save" id="save-state">Gespeichert ✓</span>
+      <button class="btn small ghost" data-act="export" title="Als Datei sichern">⤓ Exportieren</button>
       <a class="btn primary" href="#setup/${quiz.id}">Abend starten ▶</a>
+    </header>
+    <div class="ed-body">
+      <aside class="ed-side">${sidebar()}</aside>
+      <main class="ed-main">${mainPanel()}</main>
     </div>
-    <p class="muted">Änderungen werden automatisch in diesem Browser gespeichert. Mit „Exportieren“ sicherst du das Quiz als Datei.</p>
-
-    <h2 class="section-title"><span>Vorrunde · ${quiz.games.length} ${quiz.games.length === 1 ? 'Spiel' : 'Spiele'}</span></h2>
-    ${quiz.games.map(gameBlock).join('')}
-    <div class="add-row">
-      <button class="btn" data-act="addGame" data-type="quiz">+ Fragespiel</button>
-      <button class="btn" data-act="addGame" data-type="manual">+ Manuelles Spiel</button>
-    </div>
-
-    <h2 class="section-title"><span>Finale</span></h2>
-    <details class="block final-block" data-key="final" ${open.has('final') ? 'open' : ''}>
-      <summary><span class="num">🔥</span><span class="t">${esc(f.title || 'Finale')}</span>
-        <span class="tag">${f.enabled ? `${WIN_MODES[f.winMode]} · ${f.questions.length} Fragen` : 'deaktiviert'}</span></summary>
-      <div class="block-body">
-        <label class="check field"><input type="checkbox" data-bind="final.enabled" ${f.enabled ? 'checked' : ''}> Finale spielen</label>
-        <div class="row field">
-          <div class="grow"><label>Titel</label><input type="text" data-bind="final.title" value="${esc(f.title)}"></div>
-          <div class="grow"><label>Wie wird das Finale gewonnen?</label>
-            <select data-bind="final.winMode" data-rerender>${Object.entries(WIN_MODES).map(([k, v]) => `<option value="${k}" ${f.winMode === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
-        </div>
-        <div class="row field">
-          ${f.winMode === 'target' ? `<div><label>Zielpunktzahl (inkl. Vorsprung)</label><input type="number" min="1" data-bind="final.target" data-num value="${f.target}"></div>` : ''}
-          ${f.winMode === 'count' ? `<div><label>Anzahl Fragen</label><input type="number" min="1" data-bind="final.count" data-num value="${f.count}"></div>` : ''}
-          ${f.winMode === 'elimination' ? `<div><label>Leben zusätzlich zum Vorsprung</label><input type="number" min="0" data-bind="final.baseLives" data-num value="${f.baseLives}"></div>` : ''}
-          <label class="check" style="margin-bottom:.6em"><input type="checkbox" data-bind="final.headStart" ${f.headStart ? 'checked' : ''}> Vorrundenpunkte als Vorsprung</label>
-        </div>
-        <p class="muted" style="margin-top:0">${finalHint(f)}</p>
-        <div class="field"><label>Beschreibung (wird vor dem Finale gezeigt)</label><textarea data-bind="final.description">${esc(f.description)}</textarea></div>
-        ${questionList('final.questions', ALL_TYPES)}
-      </div>
-    </details>
-
-    <h2 class="section-title"><span>Stechfragen-Vorrat</span></h2>
-    <details class="block" data-key="ties" ${open.has('ties') ? 'open' : ''}>
-      <summary><span class="num">⚔️</span><span class="t">Allgemeine Stechfragen</span><span class="tag">${quiz.tiebreakers.length} Schätzfragen</span></summary>
-      <div class="block-body">
-        <p class="muted">Werden bei Gleichstand genutzt, wenn ein Spiel keine eigene Stechfrage hat, und im Finale. Wer am nächsten an der Lösung liegt, gewinnt.</p>
-        ${questionList('tiebreakers', ['estimate'])}
-      </div>
-    </details>
   </div>`;
   window.scrollTo(0, scrollY);
   hydratePreviews();
 }
 
-function finalHint(f) {
-  const max = quiz.games.reduce((s, g) => s + (Number(g.points) || 0), 0);
-  if (f.winMode === 'target') return `Jede richtige Antwort = 1 Punkt. In der Vorrunde sind maximal ${max} Punkte möglich, die Zielpunktzahl sollte darüber liegen (sonst wird sie beim Start automatisch angehoben).`;
-  if (f.winMode === 'count') return 'Jede richtige Antwort = 1 Punkt. Nach der letzten Frage gewinnt, wer die meisten Punkte hat (inkl. Vorsprung).';
-  return 'Jeder Vorrundenpunkt ist ein zusätzliches Leben. Falsche oder fehlende Antwort kostet ein Leben, bei Schätzfragen verliert, wer am weitesten weg liegt.';
+function sidebar() {
+  const item = (key, inner, cls = '') => `<button class="side-item ${sel === key ? 'on' : ''} ${cls}" data-act="select" data-key="${key}">${inner}</button>`;
+  const games = quiz.games.map((g, i) => {
+    const warn = g.questions.reduce((n, q) => n + questionWarnings(q).length, 0) + (g.type === 'quiz' && !g.questions.length ? 1 : 0);
+    return item('g:' + g.id, `<span class="si-num">${i + 1}</span><span class="si-t">${esc(g.title || 'Ohne Titel')}</span>
+      <span class="si-meta">${g.type === 'manual' ? '🏁' : g.questions.length}${warn ? ' <span class="warn-dot" title="Unvollständig">!</span>' : ''}</span>`);
+  }).join('');
+  return `
+    ${item('settings', '<span class="si-num">⚙</span><span class="si-t">Allgemein</span>')}
+    <div class="side-label">Vorrunde · ${quiz.games.length} Spiele</div>
+    <div class="side-games">${games}</div>
+    <div class="side-add">
+      <button class="btn small" data-act="addGame" data-type="quiz">+ Fragespiel</button>
+      <button class="btn small ghost" data-act="addGame" data-type="manual">+ Manuell</button>
+    </div>
+    <div class="side-label">Abschluss</div>
+    ${item('final', `<span class="si-num">🔥</span><span class="si-t">${esc(quiz.final.title || 'Finale')}</span><span class="si-meta">${quiz.final.enabled ? quiz.final.questions.length : 'aus'}</span>`)}
+    ${item('ties', `<span class="si-num">⚔</span><span class="si-t">Stechfragen</span><span class="si-meta">${quiz.tiebreakers.length}</span>`)}`;
 }
 
-function gameBlock(g, i) {
-  const key = 'g-' + g.id;
-  const p = `games.${i}`;
-  const tag = g.type === 'manual' ? 'Manuell' : `${g.questions.length} ${g.questions.length === 1 ? 'Frage' : 'Fragen'}`;
-  return `<details class="block" data-key="${key}" ${open.has(key) ? 'open' : ''}>
-    <summary>
-      <span class="num">${i + 1}</span><span class="t" data-title-of="${p}">${esc(g.title || 'Ohne Titel')}</span>
-      <span class="tag">${tag} · ${g.points} P</span>
-      <span class="icon-btns">
-        <button class="btn small ghost" data-act="move" data-path="games" data-i="${i}" data-d="-1" title="Nach oben" ${i === 0 ? 'disabled' : ''}>↑</button>
-        <button class="btn small ghost" data-act="move" data-path="games" data-i="${i}" data-d="1" title="Nach unten" ${i === quiz.games.length - 1 ? 'disabled' : ''}>↓</button>
-        <button class="btn small ghost" data-act="dupGame" data-i="${i}" title="Duplizieren">⧉</button>
-        <button class="btn small danger" data-act="del" data-path="games" data-i="${i}" title="Löschen">✕</button>
-      </span>
-    </summary>
-    <div class="block-body">
-      <div class="row field">
-        <div class="grow"><label>Spielname (wird angekündigt)</label><input type="text" data-bind="${p}.title" value="${esc(g.title)}"></div>
-        <div><label>Spieltyp</label><select data-bind="${p}.type" data-rerender>
-          <option value="quiz" ${g.type === 'quiz' ? 'selected' : ''}>Fragespiel</option>
-          <option value="manual" ${g.type === 'manual' ? 'selected' : ''}>Manuell (Sieger eintragen)</option></select></div>
-        <div style="width:110px"><label>Punkte für Sieg</label><input type="number" min="0" data-bind="${p}.points" data-num value="${g.points}"></div>
-        ${g.type === 'manual' ? `<div style="width:130px"><label>Timer (Sek., 0 = aus)</label><input type="number" min="0" data-bind="${p}.timer" data-num value="${g.timer}"></div>` : ''}
+function mainPanel() {
+  if (sel === 'settings') return settingsPanel();
+  if (sel === 'final') return finalPanel();
+  if (sel === 'ties') return tiesPanel();
+  const i = gameIndex();
+  return i >= 0 ? gamePanel(quiz.games[i], i) : settingsPanel();
+}
+
+function settingsPanel() {
+  const nq = quiz.games.reduce((s, g) => s + g.questions.length, 0);
+  return `<div class="panel">
+    <div class="panel-kicker">Allgemein</div>
+    <h2>Einstellungen des Abends</h2>
+    <div class="field"><label>Titel (erscheint im Intro)</label><input type="text" data-bind="title" value="${esc(quiz.title)}"></div>
+    <div class="field"><label>Untertitel im Intro (optional)</label><input type="text" data-bind="tagline" value="${esc(quiz.tagline || '')}" placeholder="z. B. Die große Familien-Gameshow"></div>
+    <div class="stat-row"><div><b>${quiz.games.length}</b><span>Spiele</span></div><div><b>${nq}</b><span>Fragen</span></div><div><b>${quiz.final.enabled ? quiz.final.questions.length : '–'}</b><span>Finalfragen</span></div><div><b>${quiz.tiebreakers.length}</b><span>Stechfragen</span></div></div>
+    <div class="card soft">
+      <h3>📊 Fragen aus Excel ergänzen</h3>
+      <p class="muted">Fragen in einer Tabelle sammeln und hier anhängen. Spiele mit gleichem Namen werden ergänzt, neue angelegt.</p>
+      <div class="row">
+        <label class="btn">📥 Excel-Datei wählen<input type="file" accept=".xlsx,.xls,.csv" data-excel hidden></label>
+        <button class="btn ghost" data-act="template">⤓ Vorlage herunterladen</button>
       </div>
-      <div class="field"><label>${g.type === 'manual' ? 'Regeln / Beschreibung' : 'Beschreibung (optional)'}</label><textarea data-bind="${p}.description">${esc(g.description)}</textarea></div>
-      ${g.type === 'quiz' ? `
-        ${questionList(`${p}.questions`, ALL_TYPES)}
-        <h3 style="margin-top:18px;font-size:1em">Eigene Stechfrage <span class="muted" style="font-weight:400">(optional, sonst aus dem Vorrat)</span></h3>
-        ${g.tiebreaker ? questionCard(g.tiebreaker, `${p}.tiebreaker`, 'Stechfrage', null) : `<button class="btn small" data-act="addTie" data-i="${i}">+ Stechfrage hinzufügen</button>`}
-      ` : ''}
     </div>
-  </details>`;
+  </div>`;
+}
+
+function gamePanel(g, i) {
+  const p = `games.${i}`;
+  return `<div class="panel">
+    <div class="panel-head">
+      <div class="panel-kicker">Spiel ${i + 1} von ${quiz.games.length}</div>
+      <div class="panel-actions">
+        <button class="btn small ghost" data-act="move" data-path="games" data-i="${i}" data-d="-1" ${i === 0 ? 'disabled' : ''} title="Nach oben">↑</button>
+        <button class="btn small ghost" data-act="move" data-path="games" data-i="${i}" data-d="1" ${i === quiz.games.length - 1 ? 'disabled' : ''} title="Nach unten">↓</button>
+        <button class="btn small ghost" data-act="dupGame" data-i="${i}" title="Duplizieren">⧉ Kopie</button>
+        <button class="btn small danger" data-act="del" data-path="games" data-i="${i}">Löschen</button>
+      </div>
+    </div>
+    <input type="text" class="panel-title" data-bind="${p}.title" value="${esc(g.title)}" placeholder="Spielname (wird angekündigt)">
+    <div class="row field">
+      <div class="seg">${['quiz', 'manual'].map(t => `<button class="${g.type === t ? 'on' : ''}" data-act="setType" data-path="${p}" data-val="${t}">${t === 'quiz' ? '❓ Fragespiel' : '🏁 Manuell (Sieger eintragen)'}</button>`).join('')}</div>
+      <div class="num-field"><label>Punkte für Sieg</label><input type="number" min="0" data-bind="${p}.points" data-num value="${g.points}"></div>
+      ${g.type === 'manual' ? `<div class="num-field"><label>Timer (Sek., 0 = aus)</label><input type="number" min="0" data-bind="${p}.timer" data-num value="${g.timer}"></div>` : ''}
+    </div>
+    <div class="field"><label>${g.type === 'manual' ? 'Regeln / Beschreibung' : 'Beschreibung (optional, wird angekündigt)'}</label><textarea data-bind="${p}.description" rows="2">${esc(g.description)}</textarea></div>
+    ${g.type === 'quiz' ? `
+      <div class="section-h"><h3>Fragen <span class="muted">(${g.questions.length})</span></h3>
+        ${g.questions.length > 1 ? `<button class="btn small ghost" data-act="toggleAll" data-path="${p}.questions">${g.questions.every(q => openQ.has(q.id)) ? 'Alle zuklappen' : 'Alle aufklappen'}</button>` : ''}</div>
+      ${questionList(`${p}.questions`, ALL_TYPES)}
+      <div class="section-h"><h3>Eigene Stechfrage <span class="muted">(optional, sonst aus dem Vorrat)</span></h3></div>
+      ${g.tiebreaker ? questionCard(g.tiebreaker, `${p}.tiebreaker`, 'Stechfrage', null) : `<button class="btn small ghost" data-act="addTie" data-i="${i}">+ Stechfrage (Schätzfrage) hinzufügen</button>`}
+    ` : ''}
+  </div>`;
+}
+
+function finalPanel() {
+  const f = quiz.final;
+  const max = quiz.games.reduce((s, g) => s + (Number(g.points) || 0), 0);
+  const hint = f.winMode === 'target'
+    ? `Jede richtige Antwort = 1 Punkt. In der Vorrunde sind maximal ${max} Punkte möglich, die Zielpunktzahl sollte darüber liegen.`
+    : f.winMode === 'count' ? 'Nach der letzten Frage gewinnt, wer die meisten Punkte hat (inkl. Vorsprung).'
+      : 'Jeder Vorrundenpunkt ist ein zusätzliches Leben. Falsche Antwort kostet ein Leben.';
+  return `<div class="panel">
+    <div class="panel-kicker">Abschluss</div>
+    <input type="text" class="panel-title" data-bind="final.title" value="${esc(f.title)}">
+    <label class="check field"><input type="checkbox" data-bind="final.enabled" ${f.enabled ? 'checked' : ''}> Finale spielen</label>
+    ${f.enabled ? `
+    <div class="field"><label>Wie wird das Finale gewonnen?</label>
+      <div class="seg wrap">${Object.entries(WIN_MODES).map(([k, v]) => `<button class="${f.winMode === k ? 'on' : ''}" data-act="setVal" data-path="final.winMode" data-val="${k}">${v}</button>`).join('')}</div></div>
+    <div class="row field">
+      ${f.winMode === 'target' ? `<div class="num-field"><label>Zielpunktzahl</label><input type="number" min="1" data-bind="final.target" data-num value="${f.target}"></div>` : ''}
+      ${f.winMode === 'count' ? `<div class="num-field"><label>Anzahl Fragen</label><input type="number" min="1" data-bind="final.count" data-num value="${f.count}"></div>` : ''}
+      ${f.winMode === 'elimination' ? `<div class="num-field"><label>Leben zusätzlich</label><input type="number" min="0" data-bind="final.baseLives" data-num value="${f.baseLives}"></div>` : ''}
+      <label class="check"><input type="checkbox" data-bind="final.headStart" ${f.headStart ? 'checked' : ''}> Vorrundenpunkte als Vorsprung</label>
+    </div>
+    <p class="muted sm">${hint}</p>
+    <div class="field"><label>Beschreibung (vor dem Finale)</label><textarea data-bind="final.description" rows="2">${esc(f.description)}</textarea></div>
+    <div class="section-h"><h3>Finalfragen <span class="muted">(${f.questions.length})</span></h3></div>
+    ${questionList('final.questions', ALL_TYPES)}` : ''}
+  </div>`;
+}
+
+function tiesPanel() {
+  return `<div class="panel">
+    <div class="panel-kicker">Abschluss</div>
+    <h2>Stechfragen-Vorrat</h2>
+    <p class="muted">Werden bei Gleichstand genutzt, wenn ein Spiel keine eigene Stechfrage hat, und im Finale. Wer am nächsten an der Lösung liegt, gewinnt.</p>
+    ${questionList('tiebreakers', ['estimate'])}
+  </div>`;
 }
 
 function questionList(path, types) {
   const list = get(path);
-  return `<div>${list.map((q, j) => questionCard(q, `${path}.${j}`, `Frage ${j + 1}`, { path, j, len: list.length })).join('')}</div>
-    <div class="add-row">${types.map(t => `<button class="btn small" data-act="addQ" data-path="${path}" data-type="${t}">+ ${QUESTION_TYPES[t]}</button>`).join('')}</div>`;
+  const menu = addMenu === path
+    ? `<div class="add-menu">${types.map(t => `<button class="add-type" data-act="addQ" data-path="${path}" data-type="${t}">
+        <span class="at-i">${TYPE_ICONS[t]}</span><span class="at-t"><b>${QUESTION_TYPES[t]}</b><small>${TYPE_HINTS[t]}</small></span></button>`).join('')}
+        <button class="btn small ghost" data-act="addMenu" data-path="">Abbrechen</button></div>`
+    : types.length === 1
+      ? `<button class="btn add-q" data-act="addQ" data-path="${path}" data-type="${types[0]}">+ ${QUESTION_TYPES[types[0]]}</button>`
+      : `<button class="btn add-q" data-act="addMenu" data-path="${path}">+ Frage hinzufügen</button>`;
+  return `<div class="qlist">${list.map((q, j) => questionCard(q, `${path}.${j}`, `${j + 1}`, { path, j, len: list.length })).join('')}</div>${menu}`;
 }
 
 function questionCard(q, p, label, pos) {
+  const isOpen = openQ.has(q.id);
+  const warns = questionWarnings(q);
   const controls = pos
-    ? `<button class="btn small ghost" data-act="move" data-path="${pos.path}" data-i="${pos.j}" data-d="-1" ${pos.j === 0 ? 'disabled' : ''}>↑</button>
-       <button class="btn small ghost" data-act="move" data-path="${pos.path}" data-i="${pos.j}" data-d="1" ${pos.j === pos.len - 1 ? 'disabled' : ''}>↓</button>
-       <button class="btn small danger" data-act="del" data-path="${pos.path}" data-i="${pos.j}">✕</button>`
-    : `<button class="btn small danger" data-act="delTie" data-path="${p}">✕</button>`;
-  let answer = '';
-  if (q.type === 'mc') {
-    answer = `<label>Antworten – richtige Antwort anklicken</label><div class="opts">${q.options.map((o, k) => `
-      <div class="opt"><input type="radio" name="r-${q.id}" data-bind="${p}.correct" data-num value="${k}" ${q.correct === k ? 'checked' : ''} title="Richtige Antwort">
-        <span class="letter" style="background:${OPTION_COLORS[k]}">${OPTION_LETTERS[k]}</span>
-        <input type="text" data-bind="${p}.options.${k}" value="${esc(o)}" placeholder="Antwort ${OPTION_LETTERS[k]}${k > 1 ? ' (optional)' : ''}"></div>`).join('')}</div>`;
-  } else if (q.type === 'tf') {
-    answer = `<div style="width:200px"><label>Richtige Antwort</label><select data-bind="${p}.correct" data-bool>
-      <option value="true" ${q.correct ? 'selected' : ''}>Wahr</option><option value="false" ${!q.correct ? 'selected' : ''}>Falsch</option></select></div>`;
-  } else if (q.type === 'order') {
-    answer = `<label>Einträge in der <b>richtigen</b> Reihenfolge (auf den Handys erscheinen sie gemischt)</label>
-      <div class="order-edit">${q.items.map((t, k) => `<div class="opt"><span class="letter" style="background:var(--panel2)">${k + 1}</span>
-        <input type="text" data-bind="${p}.items.${k}" value="${esc(t)}" placeholder="Eintrag ${k + 1}">
-        ${q.items.length > 2 ? `<button class="btn small ghost" data-act="delItem" data-path="${p}" data-i="${k}" title="Entfernen">✕</button>` : ''}</div>`).join('')}</div>
-      ${q.items.length < 6 ? `<button class="btn small" style="margin-top:6px" data-act="addItem" data-path="${p}">+ Eintrag</button>` : ''}
-      <p class="muted" style="margin:.4em 0 0;font-size:.85em">Zählt als richtig, wenn die komplette Reihenfolge stimmt.</p>`;
-  } else if (q.type === 'buzzer') {
-    answer = `<div class="field"><label>Lösung (wird bei der Auflösung gezeigt)</label><input type="text" data-bind="${p}.answer" value="${esc(q.answer || '')}"></div>
-      <p class="muted" style="margin:0;font-size:.85em">Wer zuerst buzzert, antwortet laut. Du wertest mit „Richtig“ oder „Falsch“. Falsch = Minuspunkt, die Frage ist dann vorbei. Die Zeit ist das Buzzer-Fenster.</p>`;
-  } else {
-    answer = `<div class="row"><div style="width:200px"><label>Lösung (Zahl)</label><input type="number" step="any" data-bind="${p}.correct" data-num value="${q.correct}"></div>
-      <div style="width:160px"><label>Einheit (optional)</label><input type="text" data-bind="${p}.unit" value="${esc(q.unit || '')}" placeholder="z. B. km"></div></div>`;
-  }
-  return `<div class="q">
-    <div class="q-head"><span class="type">${label} · ${QUESTION_TYPES[q.type]}</span>
-      <label style="margin:0;display:flex;align-items:center;gap:.4em">Zeit <input type="number" min="5" style="width:80px" data-bind="${p}.time" data-num value="${q.time}"> s</label>
-      ${controls}</div>
-    <div class="field"><textarea data-bind="${p}.text" placeholder="Fragetext">${esc(q.text)}</textarea></div>
-    <div class="field">${q.image
-      ? `<img class="thumb" src="${q.image}" alt=""><button class="btn small danger" data-act="imgDel" data-path="${p}">Bild entfernen</button>`
-      : `<label class="btn small" style="display:inline-flex;color:var(--text);font-size:.88em">🖼 Bild hinzufügen<input type="file" accept="image/*" data-img="${p}" hidden></label>`}
-      ${mediaEditor(q, p)}</div>
-    ${answer}
-    <details class="notes" ${q.notes ? 'open' : ''}><summary>🎙 Moderationsnotiz (nur Spielleiter-Handy)</summary>
-      <textarea data-bind="${p}.notes" placeholder="z. B. Hintergrundinfo, Anekdote, Aussprache …">${esc(q.notes || '')}</textarea></details>
+    ? `<button class="btn tiny ghost" data-act="move" data-path="${pos.path}" data-i="${pos.j}" data-d="-1" ${pos.j === 0 ? 'disabled' : ''} title="Nach oben">↑</button>
+       <button class="btn tiny ghost" data-act="move" data-path="${pos.path}" data-i="${pos.j}" data-d="1" ${pos.j === pos.len - 1 ? 'disabled' : ''} title="Nach unten">↓</button>
+       <button class="btn tiny ghost" data-act="dupQ" data-path="${pos.path}" data-i="${pos.j}" title="Duplizieren">⧉</button>
+       <button class="btn tiny danger" data-act="del" data-path="${pos.path}" data-i="${pos.j}" title="Löschen">✕</button>`
+    : `<button class="btn tiny danger" data-act="delTie" data-path="${p}" title="Löschen">✕</button>`;
+  return `<div class="q ${isOpen ? 'open' : ''}">
+    <div class="q-head" data-act="toggleQ" data-id="${q.id}">
+      <span class="q-num">${label}</span><span class="q-ic" title="${QUESTION_TYPES[q.type]}">${TYPE_ICONS[q.type]}</span>
+      <span class="q-sum"><span class="q-type">${QUESTION_TYPES[q.type]}</span><span class="q-txt">${esc(questionLabel(q))}</span></span>
+      ${warns.length ? `<span class="warn-dot" title="${esc(warns.join(' · '))}">!</span>` : ''}
+      <span class="q-actions">
+        <button class="btn tiny" data-act="preview" data-path="${p}" title="So sieht es auf dem TV aus">▶ Vorschau</button>
+        ${controls}
+      </span>
+    </div>
+    ${isOpen ? `<div class="q-body">${questionBody(q, p, warns)}</div>` : ''}
   </div>`;
 }
 
-// ---------------------------------------------------------------- Ereignisse
+function questionBody(q, p, warns) {
+  const time = `<div class="num-field"><label>Zeit (Sek.)</label><input type="number" min="5" data-bind="${p}.time" data-num value="${q.time}"></div>`;
+  const textField = `<div class="field grow"><label>${q.type === 'hilo' ? 'Fragetext' : 'Frage'}</label><textarea data-bind="${p}.text" rows="2" placeholder="Fragetext">${esc(q.text)}</textarea></div>`;
+  const answerAlt = `<div class="row">
+      <div class="field grow"><label>Lösung</label><input type="text" data-bind="${p}.answer" value="${esc(q.answer || '')}"></div>
+      ${q.type !== 'buzzer' ? `<div class="field grow"><label>Auch richtig (mit | trennen)</label><input type="text" data-bind="${p}.alternatives" value="${esc(q.alternatives || '')}" placeholder="z. B. Einstein | A. Einstein"></div>` : ''}
+    </div>`;
+  const modeSeg = `<div class="field"><label>So wird geantwortet</label><div class="seg">
+      <button class="${q.mode !== 'text' ? 'on' : ''}" data-act="setVal" data-path="${p}.mode" data-val="buzzer">🔔 Buzzer (laut sagen, du wertest)</button>
+      <button class="${q.mode === 'text' ? 'on' : ''}" data-act="setVal" data-path="${p}.mode" data-val="text">✍ Freitext (alle tippen)</button></div></div>`;
+
+  let answer = '';
+  switch (q.type) {
+    case 'mc':
+      answer = `<label>Antworten – richtige Antwort links anklicken</label><div class="opts">${q.options.map((o, k) => `
+        <div class="opt ${q.correct === k ? 'is-right' : ''}"><input type="radio" name="r-${q.id}" data-bind="${p}.correct" data-num value="${k}" ${q.correct === k ? 'checked' : ''} title="Richtige Antwort">
+          <span class="letter" style="background:${OPTION_COLORS[k]}">${OPTION_LETTERS[k]}</span>
+          <input type="text" data-bind="${p}.options.${k}" value="${esc(o)}" placeholder="Antwort ${OPTION_LETTERS[k]}${k > 1 ? ' (optional)' : ''}"></div>`).join('')}</div>`;
+      break;
+    case 'tf':
+      answer = `<div class="field"><label>Richtige Antwort</label><div class="seg">
+        <button class="${q.correct ? 'on' : ''}" data-act="setVal" data-path="${p}.correct" data-val="true">✓ Wahr</button>
+        <button class="${!q.correct ? 'on' : ''}" data-act="setVal" data-path="${p}.correct" data-val="false">✗ Falsch</button></div></div>`;
+      break;
+    case 'estimate':
+      answer = `<div class="row"><div class="num-field"><label>Lösung (Zahl)</label><input type="number" step="any" data-bind="${p}.correct" data-num value="${q.correct}"></div>
+        <div class="field"><label>Einheit (optional)</label><input type="text" data-bind="${p}.unit" value="${esc(q.unit || '')}" placeholder="z. B. km"></div></div>`;
+      break;
+    case 'order':
+      answer = `<label>Einträge in der <b>richtigen</b> Reihenfolge (auf den Handys gemischt)</label>
+        <div class="list-edit">${q.items.map((t, k) => `<div class="opt"><span class="letter plain">${k + 1}</span>
+          <input type="text" data-bind="${p}.items.${k}" value="${esc(t)}" placeholder="Eintrag ${k + 1}">
+          ${q.items.length > 2 ? `<button class="btn tiny ghost" data-act="delItem" data-path="${p}" data-list="items" data-i="${k}">✕</button>` : ''}</div>`).join('')}</div>
+        ${q.items.length < 6 ? `<button class="btn small ghost" data-act="addItem" data-path="${p}" data-list="items">+ Eintrag</button>` : ''}`;
+      break;
+    case 'buzzer':
+      answer = `${answerAlt}<p class="muted sm">Wer zuerst buzzert, antwortet laut. Falsch = Minuspunkt, die Frage ist dann vorbei. Die Zeit ist das Buzzer-Fenster.</p>`;
+      break;
+    case 'hint':
+      answer = `<label>Hinweise (vom schwersten zum leichtesten)</label>
+        <div class="list-edit">${q.hints.map((t, k) => `<div class="opt"><span class="letter plain">${k + 1}</span>
+          <input type="text" data-bind="${p}.hints.${k}" value="${esc(t)}" placeholder="Hinweis ${k + 1}">
+          ${q.hints.length > 1 ? `<button class="btn tiny ghost" data-act="delItem" data-path="${p}" data-list="hints" data-i="${k}">✕</button>` : ''}</div>`).join('')}</div>
+        ${q.hints.length < 6 ? `<button class="btn small ghost" data-act="addItem" data-path="${p}" data-list="hints">+ Hinweis</button>` : ''}
+        <div class="row field"><div class="num-field"><label>Neuer Hinweis alle … Sek. (0 = nur per Knopf)</label><input type="number" min="0" data-bind="${p}.hintEvery" data-num value="${q.hintEvery}"></div></div>
+        ${modeSeg}${answerAlt}`;
+      break;
+    case 'reveal':
+      answer = `${modeSeg}${answerAlt}<p class="muted sm">Das Bild oben wird auf dem TV von grob verpixelt bis scharf aufgedeckt – über die eingestellte Zeit.</p>`;
+      break;
+    case 'text':
+      answer = `${answerAlt}<p class="muted sm">Antworten, die zur Lösung passen (Groß/Klein und kleine Tippfehler egal), werden automatisch als richtig vorgeschlagen. Du kannst am Spielleiter-Handy umschalten.</p>`;
+      break;
+    case 'hilo':
+      answer = `<div class="hilo-edit">
+          <div class="card soft"><label>Startwert (bekannt)</label><input type="text" data-bind="${p}.refLabel" value="${esc(q.refLabel)}" placeholder="z. B. Berlin">
+            <input type="number" step="any" data-bind="${p}.refValue" data-num value="${q.refValue}"></div>
+          <div class="hilo-vs-e">▲▼</div>
+          <div class="card soft"><label>Vergleichswert (gesucht)</label><input type="text" data-bind="${p}.itemLabel" value="${esc(q.itemLabel)}" placeholder="z. B. Hamburg">
+            <input type="number" step="any" data-bind="${p}.itemValue" data-num value="${q.itemValue}"></div>
+        </div>
+        <div class="row"><div class="field"><label>Einheit (optional)</label><input type="text" data-bind="${p}.unit" value="${esc(q.unit || '')}" placeholder="z. B. Mio. Einwohner"></div>
+          <button class="btn small ghost" data-act="hiloText" data-path="${p}">✨ Fragetext vorschlagen</button></div>`;
+      break;
+  }
+
+  const imageField = q.type === 'reveal'
+    ? (q.image ? `<div class="media-box"><img class="thumb big" src="${q.image}" alt=""><button class="btn small danger" data-act="imgDel" data-path="${p}">Bild entfernen</button></div>`
+      : `<label class="drop">🖼 Bild auswählen (Pflicht)<input type="file" accept="image/*" data-img="${p}" hidden></label>`)
+    : (q.image ? `<div class="media-box"><img class="thumb" src="${q.image}" alt=""><button class="btn small danger" data-act="imgDel" data-path="${p}">Bild entfernen</button></div>`
+      : `<label class="btn small ghost">🖼 Bild<input type="file" accept="image/*" data-img="${p}" hidden></label>`);
+
+  return `
+    ${warns.length ? `<div class="notice small">⚠ ${esc(warns.join(' · '))}</div>` : ''}
+    <div class="row">${textField}${time}</div>
+    ${q.type === 'reveal' ? `<div class="field">${imageField}</div>` : ''}
+    ${answer}
+    <details class="more-opts" ${q.media || (q.image && q.type !== 'reveal') || q.notes ? 'open' : ''}><summary>Medien & Notiz</summary>
+      <div class="media-row">${q.type !== 'reveal' ? imageField : ''}${mediaEditor(q, p)}</div>
+      <div class="field"><label>🎙 Moderationsnotiz (nur Spielleiter-Handy)</label><textarea data-bind="${p}.notes" rows="2" placeholder="z. B. Hintergrundinfo, Anekdote, Aussprache …">${esc(q.notes || '')}</textarea></div>
+    </details>`;
+}
 
 function mediaEditor(q, p) {
   const m = q.media;
   const first = `<label class="check" style="margin-top:6px"><input type="checkbox" data-bind="${p}.mediaFirst" ${q.mediaFirst ? 'checked' : ''}> Erst abspielen, dann Antworten freigeben</label>`;
   if (!m) {
-    return `<label class="btn small" style="display:inline-flex;color:var(--text);font-size:.88em">🎬 Video/Audio-Datei<input type="file" accept="video/*,audio/*" data-mediafile="${p}" hidden></label>
-      <button class="btn small" data-act="mediaYT" data-path="${p}">▶ YouTube-Link</button>`;
+    return `<label class="btn small ghost">🎬 Video/Audio<input type="file" accept="video/*,audio/*" data-mediafile="${p}" hidden></label>
+      <button class="btn small ghost" data-act="mediaYT" data-path="${p}">▶ YouTube-Link</button>`;
   }
   if (m.kind === 'file') {
     const isAudio = (m.mime || '').startsWith('audio');
-    return `<div class="media-box"><b>${isAudio ? '🔊' : '🎬'} ${esc(m.name || 'Mediendatei')}</b> <span class="muted">(${(m.size / 1048576).toFixed(1)} MB)</span>
-      <button class="btn small danger" data-act="mediaDel" data-path="${p}">Entfernen</button>
+    return `<div class="media-box"><b>${isAudio ? '🔊' : '🎬'} ${esc(m.name || 'Mediendatei')}</b> <span class="muted">(${((m.size || 0) / 1048576).toFixed(1)} MB)</span>
+      <button class="btn tiny danger" data-act="mediaDel" data-path="${p}">Entfernen</button>
       <div><${isAudio ? 'audio' : 'video'} class="media-preview" data-prev="${m.id}" controls preload="metadata"></${isAudio ? 'audio' : 'video'}></div>
-      <div class="row" style="margin-top:6px">
-        <div style="width:150px"><label>Start (Sek.)</label><input type="number" min="0" step="0.5" data-bind="${p}.media.start" data-num value="${m.start || 0}"></div>
-        <div style="width:190px"><label>Ende (Sek., 0 = bis Schluss)</label><input type="number" min="0" step="0.5" data-bind="${p}.media.end" data-num value="${m.end || 0}"></div>
-        <button class="btn small" data-act="mediaMark" data-path="${p}" data-which="start" title="Aktuelle Position der Vorschau als Start übernehmen">⏮ Start = Vorschau</button>
-        <button class="btn small" data-act="mediaMark" data-path="${p}" data-which="end" title="Aktuelle Position der Vorschau als Ende übernehmen">⏭ Ende = Vorschau</button>
+      <div class="row">
+        <div class="num-field"><label>Start (Sek.)</label><input type="number" min="0" step="0.5" data-bind="${p}.media.start" data-num value="${m.start || 0}"></div>
+        <div class="num-field"><label>Ende (0 = Schluss)</label><input type="number" min="0" step="0.5" data-bind="${p}.media.end" data-num value="${m.end || 0}"></div>
+        <button class="btn small ghost" data-act="mediaMark" data-path="${p}" data-which="start">⏮ Start = Vorschau</button>
+        <button class="btn small ghost" data-act="mediaMark" data-path="${p}" data-which="end">⏭ Ende = Vorschau</button>
       </div>${first}</div>`;
   }
-  return `<div class="media-box"><b>▶ YouTube</b> <button class="btn small danger" data-act="mediaDel" data-path="${p}">Entfernen</button>
-    <div class="row" style="margin-top:6px"><div class="grow"><label>Link</label><input type="text" data-bind="${p}.media.url" value="${esc(m.url || '')}" placeholder="https://www.youtube.com/watch?v=…"></div>
-      <div style="width:110px"><label>Start (Sek.)</label><input type="number" min="0" data-bind="${p}.media.start" data-num value="${m.start || 0}"></div>
-      <div style="width:110px"><label>Ende (Sek., 0 = bis Schluss)</label><input type="number" min="0" data-bind="${p}.media.end" data-num value="${m.end || 0}"></div></div>
-    <div class="muted" style="font-size:.85em">${m.vid ? `Video erkannt ✓ (${esc(m.vid)})` : 'Noch kein gültiger Link.'} Braucht am Abend Internet. Manche Videos erlauben kein Einbetten.</div>${first}</div>`;
+  return `<div class="media-box"><b>▶ YouTube</b> <button class="btn tiny danger" data-act="mediaDel" data-path="${p}">Entfernen</button>
+    <div class="row"><div class="field grow"><label>Link</label><input type="text" data-bind="${p}.media.url" value="${esc(m.url || '')}" placeholder="https://www.youtube.com/watch?v=…"></div>
+      <div class="num-field"><label>Start (Sek.)</label><input type="number" min="0" data-bind="${p}.media.start" data-num value="${m.start || 0}"></div>
+      <div class="num-field"><label>Ende (0 = Schluss)</label><input type="number" min="0" data-bind="${p}.media.end" data-num value="${m.end || 0}"></div></div>
+    <div class="muted sm">${m.vid ? `Video erkannt ✓` : 'Noch kein gültiger Link.'} Braucht am Abend Internet.</div>${first}</div>`;
 }
 
 async function hydratePreviews() {
@@ -245,6 +356,45 @@ async function hydratePreviews() {
     if (url) el.src = url;
   }
 }
+
+// ---------------------------------------------------------------- Vorschau
+
+function openPreview(path, mode = 'q') {
+  const q = get(path);
+  if (!q) return;
+  closePreview();
+  const ov = document.createElement('div');
+  ov.id = 'pv';
+  ov.innerHTML = `<div class="pv-box">
+    <div class="pv-bar"><b>Vorschau</b> <span class="muted">so sieht es auf dem TV aus</span>
+      <span class="spacer"></span>
+      <div class="seg small"><button class="${mode === 'q' ? 'on' : ''}" data-pv="q">Frage</button><button class="${mode === 'reveal' ? 'on' : ''}" data-pv="reveal">Auflösung</button></div>
+      <button class="btn small ghost" data-pv="close">Schließen ✕</button></div>
+    <div class="pv-frame"><div class="pv-scale" id="pv-scale"></div></div></div>`;
+  document.body.appendChild(ov);
+  const scaleBox = $('#pv-scale');
+  renderPreview(scaleBox, quiz, JSON.parse(JSON.stringify(q)), mode);
+  const fit = () => {
+    const frame = ov.querySelector('.pv-frame');
+    const s = Math.min(frame.clientWidth / 1280, frame.clientHeight / 720);
+    scaleBox.style.transform = `scale(${s})`;
+  };
+  fit();
+  window.addEventListener('resize', fit);
+  ov._fit = fit;
+  ov.onclick = e => {
+    const b = e.target.closest('[data-pv]');
+    if (e.target === ov || (b && b.dataset.pv === 'close')) return closePreview();
+    if (b) openPreview(path, b.dataset.pv);
+  };
+}
+
+function closePreview() {
+  const ov = $('#pv');
+  if (ov) { window.removeEventListener('resize', ov._fit); ov.remove(); }
+}
+
+// ---------------------------------------------------------------- Ereignisse
 
 function valueOf(el) {
   if (el.type === 'checkbox') return el.checked;
@@ -257,13 +407,29 @@ function onInput(e) {
   const el = e.target;
   if (!el.dataset.bind || el.type === 'radio' || el.type === 'checkbox' || el.tagName === 'SELECT') return;
   set(el.dataset.bind, valueOf(el));
-  const t = root.querySelector(`[data-title-of="${el.dataset.bind.replace(/\.title$/, '')}"]`);
-  if (t && el.dataset.bind.endsWith('.title')) t.textContent = el.value || 'Ohne Titel';
+  // Titel in der Seitenleiste live mitziehen
+  if (/^games\.\d+\.title$/.test(el.dataset.bind)) {
+    const item = root.querySelector('.side-item.on .si-t');
+    if (item) item.textContent = el.value || 'Ohne Titel';
+  }
+  if (el.dataset.bind === 'title') $$('[data-bind="title"]', root).forEach(x => { if (x !== el) x.value = el.value; });
   scheduleSave();
 }
 
 async function onChange(e) {
   const el = e.target;
+  if ('excel' in el.dataset) {
+    const file = el.files && el.files[0];
+    if (!file) return;
+    try {
+      const res = await importExcelInto(quiz, file);
+      scheduleSave();
+      render();
+      toast(`${res.added} Fragen übernommen${res.warnings.length ? ` · ${res.warnings.length} Hinweise` : ''}`, 4000);
+      if (res.warnings.length) alert('Hinweise zum Import:\n\n' + res.warnings.slice(0, 15).join('\n'));
+    } catch (err) { toast('Excel konnte nicht gelesen werden: ' + err.message, 5000); }
+    return;
+  }
   if (el.dataset.mediafile) {
     const file = el.files && el.files[0];
     if (!file) return;
@@ -291,8 +457,7 @@ async function onChange(e) {
     const file = el.files && el.files[0];
     if (!file) return;
     try {
-      const data = await readImage(file);
-      set(el.dataset.img + '.image', data);
+      set(el.dataset.img + '.image', await readImage(file));
       scheduleSave();
       render();
     } catch (err) { toast(err.message); }
@@ -302,32 +467,53 @@ async function onChange(e) {
   if (el.type === 'radio' || el.type === 'checkbox' || el.tagName === 'SELECT') {
     set(el.dataset.bind, valueOf(el));
     scheduleSave();
-    if ('rerender' in el.dataset || el.type === 'checkbox') render();
+    render();
   }
-}
-
-function onToggle(e) {
-  const d = e.target;
-  if (d.tagName !== 'DETAILS' || !d.dataset.key) return;
-  d.open ? open.add(d.dataset.key) : open.delete(d.dataset.key);
 }
 
 function onClick(e) {
   const b = e.target.closest('[data-act]');
   if (!b) return;
-  // Buttons in <summary> sollen nicht auf-/zuklappen
+  // Klicks auf Knöpfe im Fragenkopf sollen die Frage nicht auf-/zuklappen
+  if (b.dataset.act === 'toggleQ' && e.target.closest('button')) return;
   e.preventDefault();
   const { act, path, type } = b.dataset;
   const i = Number(b.dataset.i);
   switch (act) {
+    case 'select':
+      sel = b.dataset.key; addMenu = null;
+      render();
+      window.scrollTo(0, 0);
+      return;
     case 'export':
       flush();
-      bundleQuiz(quiz).then(b => downloadJSON(b, `${slug(quiz.title)}.quiz.json`));
+      bundleQuiz(quiz).then(x => downloadJSON(x, `${slug(quiz.title)}.quiz.json`));
+      return;
+    case 'template':
+      import('./excel.js').then(m => m.downloadTemplate()).catch(err => toast('Vorlage nicht verfügbar: ' + err.message));
+      return;
+    case 'preview':
+      openPreview(path);
+      return;
+    case 'toggleQ':
+      openQ.has(b.dataset.id) ? openQ.delete(b.dataset.id) : openQ.add(b.dataset.id);
+      render();
+      return;
+    case 'toggleAll': {
+      const list = get(path);
+      const allOpen = list.every(q => openQ.has(q.id));
+      list.forEach(q => (allOpen ? openQ.delete(q.id) : openQ.add(q.id)));
+      render();
+      return;
+    }
+    case 'addMenu':
+      addMenu = path || null;
+      render();
       return;
     case 'addGame': {
       const g = newGame(quiz.games.length + 1, type);
       quiz.games.push(g);
-      open.add('g-' + g.id);
+      sel = 'g:' + g.id;
       break;
     }
     case 'dupGame': {
@@ -337,10 +523,30 @@ function onClick(e) {
       copy.questions.forEach(q => { q.id = uid(); });
       if (copy.tiebreaker) copy.tiebreaker.id = uid();
       quiz.games.splice(i + 1, 0, copy);
+      sel = 'g:' + copy.id;
+      break;
+    }
+    case 'setType':
+      set(path + '.type', b.dataset.val);
+      break;
+    case 'setVal': {
+      let v = b.dataset.val;
+      if (v === 'true') v = true; else if (v === 'false') v = false;
+      set(path, v);
       break;
     }
     case 'addQ': {
-      get(path).push(newQuestion(type));
+      const q = newQuestion(type);
+      get(path).push(q);
+      openQ.add(q.id);
+      addMenu = null;
+      break;
+    }
+    case 'dupQ': {
+      const arr = get(path);
+      const copy = normalizeQuestion({ ...JSON.parse(JSON.stringify(arr[i])), id: uid() });
+      arr.splice(i + 1, 0, copy);
+      openQ.add(copy.id);
       break;
     }
     case 'move': {
@@ -351,14 +557,18 @@ function onClick(e) {
     }
     case 'del': {
       const arr = get(path);
-      const what = path === 'games' ? `Spiel „${arr[i].title}“` : 'diese Frage';
+      const what = path === 'games' ? `Spiel „${arr[i].title}“ mit allen Fragen` : 'diese Frage';
       if (!confirm(`${what} wirklich löschen?`)) return;
       arr.splice(i, 1);
+      if (path === 'games') sel = quiz.games[Math.min(i, quiz.games.length - 1)] ? 'g:' + quiz.games[Math.min(i, quiz.games.length - 1)].id : 'settings';
       break;
     }
-    case 'addTie':
-      quiz.games[i].tiebreaker = newQuestion('estimate');
+    case 'addTie': {
+      const q = newQuestion('estimate');
+      quiz.games[i].tiebreaker = q;
+      openQ.add(q.id);
       break;
+    }
     case 'delTie':
       if (!confirm('Stechfrage löschen?')) return;
       set(path, null);
@@ -373,7 +583,6 @@ function onClick(e) {
       set(path + '.media', null);
       break;
     case 'mediaMark': {
-      // Position aus der Vorschau übernehmen
       const m = get(path + '.media');
       const prev = b.closest('.media-box').querySelector('.media-preview');
       if (!m || !prev) return;
@@ -381,11 +590,17 @@ function onClick(e) {
       break;
     }
     case 'addItem':
-      get(path).items.push('');
+      get(path)[b.dataset.list].push('');
       break;
     case 'delItem':
-      get(path).items.splice(i, 1);
+      get(path)[b.dataset.list].splice(i, 1);
       break;
+    case 'hiloText': {
+      const q = get(path);
+      const unit = q.unit ? ' ' + q.unit : '';
+      q.text = `${q.refLabel || 'A'} hat ${String(q.refValue).replace('.', ',')}${unit}. Hat ${q.itemLabel || 'B'} mehr oder weniger?`;
+      break;
+    }
     default:
       return;
   }
